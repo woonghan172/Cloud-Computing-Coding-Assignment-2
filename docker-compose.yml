@@ -1,0 +1,44 @@
+services:
+  kv1:
+    build: . # build from the current dictory
+    container_name: kv1
+    ports:
+      - "8081:8080"
+    environment:
+      - SELF_NODE=http://kv1:8080
+      - NODES=${NODES_LIST}           # the whole hash ring
+      - DATA_FILE=/data/data1.json    # the data file for this node
+      - LOG_FILE=/data/logger1.log    # the log file for this node
+    volumes:
+      - kv1_data:/data
+
+  kv2:
+    build: .
+    container_name: kv2
+    ports:
+      - "8082:8080"
+    environment:
+      - SELF_NODE=http://kv2:8080
+      - NODES=${NODES_LIST}
+      - DATA_FILE=/data/data2.json
+      - LOG_FILE=/data/logger2.log
+    volumes:
+      - kv2_data:/data
+
+  kv3:
+    build: .
+    container_name: kv3
+    ports:
+      - "8083:8080"
+    environment:
+      - SELF_NODE=http://kv3:8080
+      - NODES=${NODES_LIST}
+      - DATA_FILE=/data/data3.json
+      - LOG_FILE=/data/logger3.log
+    volumes:
+      - kv3_data:/data
+
+volumes:
+  kv1_data:
+  kv2_data:
+  kv3_data:

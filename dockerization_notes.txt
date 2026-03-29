@@ -1,0 +1,34 @@
+< Build the image >
+docker build -t kv-store:latest .
+
+< Run the container (simple way) >
+docker run --rm -p 8080:8080 kv-store:latest
+
+< Run with persistent data >
+
+  1. If there isn't, create a directory 'data' and there should be data.json or logger.log (pre-existed ones can be used)
+  mkdir -p data               # create parent folder if missing
+  touch data/data.json
+  echo '{}' > data/data.json  # make it valid empty JSON — your app prefers this
+  touch data/logger.log
+
+  2. Run with volume mount for persistence
+  docker run --rm -p 8080:8080 \
+    -v $(pwd)/data/data.json:/app/data.json \
+    -v $(pwd)/data/logger.log:/app/logger.log \
+    kv-store:latest
+
+< Quick test >
+ - Check root endpoint
+curl http://localhost:8080/
+
+ - Add a key
+curl -X POST http://localhost:8080/mykey \
+  -H "Content-Type: application/json" \
+  -d '{"value": "hello docker"}'
+
+ - Get it back
+curl http://localhost:8080/mykey
+
+ - See all
+curl http://localhost:8080/all

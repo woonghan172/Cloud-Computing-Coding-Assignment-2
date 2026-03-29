@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.env
+*.log
+data.json
+logger.log
+server.log
+.git
+.gitignore
+README.md
+benchmark.py
+integration_test.py
