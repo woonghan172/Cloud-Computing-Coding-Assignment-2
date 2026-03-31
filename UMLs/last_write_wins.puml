@@ -1,0 +1,29 @@
+@startuml
+actor Client
+participant "Proxy Server" as Proxy
+participant "ConsistentHashRing" as Ring
+participant "Primary KV Node" as Node
+
+Client -> Proxy: POST /{key} (value)
+activate Proxy
+
+Proxy -> Proxy: Generate master timestamp (time.time())
+Proxy -> Ring: get_node(key)
+Ring --> Proxy: Return target Node URL
+
+Proxy -> Node: POST /{key} (value, timestamp)
+activate Node
+
+alt Incoming TS > Existing TS (or No existing data)
+    Node -> Node: Update store[key]
+    Node -> Node: save_to_disk()
+    Node --> Proxy: {"status": "OK"}
+else Incoming TS <= Existing TS
+    Node --> Proxy: {"status": "Ignored", "reason": "Stale data"}
+end
+deactivate Node
+
+Proxy --> Client: Final Status Response
+deactivate Proxy
+
+@enduml

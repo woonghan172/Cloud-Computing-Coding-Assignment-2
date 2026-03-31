@@ -1,0 +1,28 @@
+services:
+  kv-1:
+    build: .
+    volumes:
+    - ./data/kv-1/data.json:/app/data.json
+    - ./data/kv-1/logger.log:/app/logger.log
+  kv-2:
+    build: .
+    volumes:
+    - ./data/kv-2/data.json:/app/data.json
+    - ./data/kv-2/logger.log:/app/logger.log
+  kv-3:
+    build: .
+    volumes:
+    - ./data/kv-3/data.json:/app/data.json
+    - ./data/kv-3/logger.log:/app/logger.log
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    depends_on:
+    - kv-1
+    - kv-2
+    - kv-3
+    environment:
+      NODE_LIST: http://kv-1:8080,http://kv-2:8080,http://kv-3:8080
+    ports:
+    - 8080:8080

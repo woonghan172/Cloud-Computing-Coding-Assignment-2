@@ -1,0 +1,53 @@
+@startuml
+skinparam componentStyle uml2
+title Distributed KV Store System Structure
+
+package "Client Layer" {
+    [Client/Tester] as Client
+}
+
+package "Proxy Layer (Containerized)" {
+    component "Proxy Server (FastAPI)" as Proxy {
+        [heartbeat_checker()] as Heartbeat
+        [get_key()] as GetRoute
+        [put_key()] as PutRoute
+    }
+    
+    component "ConsistentHashRing" as Ring {
+        [add_node()]
+        [remove_node()]
+        [get_node()]
+        [get_nodes()]
+    }
+}
+
+package "Storage Layer (Multiple Containers)" {
+    node "KV Store Node 1" {
+        [Main App (FastAPI)] as App1
+        database "data.json" as DB1
+    }
+    node "KV Store Node 2" {
+        [Main App (FastAPI)] as App2
+        database "data.json" as DB2
+    }
+    node "KV Store Node 3" {
+        [Main App (FastAPI)] as App3
+        database "data.json" as DB3
+    }
+}
+
+' Relationships
+Client --> Proxy : HTTP GET/POST/DELETE
+Proxy ..> Ring : Uses for Routing 
+Heartbeat ..> App1 : Health Check
+Heartbeat ..> App2 : Health Check
+Heartbeat ..> App3 : Health Check
+
+GetRoute --> App1 : Read
+PutRoute --> App1 : Write
+
+App1 --> DB1 : Persistence
+App2 --> DB2 : Persistence
+App3 --> DB3 : Persistence
+
+@enduml

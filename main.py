@@ -1,73 +1,58 @@
-from fastapi import FastAPI
-from fastapi import HTTPException
-import uvicorn
-from storage import store, lock
-import json
-import os
-
+import os, json, logging, time, sys
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from storage import store, lock
 
-import logging
-
-
+# Ensure logs show up immediately in Docker
 logging.basicConfig(
-    filename="logger.log",
     level=logging.INFO,
-    format="%(asctime)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# to ensure the data type
+DATA_FILE = "data.json"
+
 class Item(BaseModel):
     value: str
-   
-DATA_FILE = "data.json" 
+    timestamp: float
+
 def save_to_disk():
     with open(DATA_FILE, "w") as f:
         json.dump(store, f)
 
 app = FastAPI()
 
-# for the requirements of Persistence
-# Load existing data if file exists and contains valid JSON
+# Initial Load from Disk
 if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
     with open(DATA_FILE, "r") as f:
         try:
             store.update(json.load(f))
-        except json.JSONDecodeError:
-            logging.warning("data.json is invalid JSON; starting with empty store")
-
-@app.get("/")
-def root():
-    return {"message": "KV Store Running"}
-
-# need to be above the @app.get("/{key}")
-@app.get("/all")
-def get_all():
-    with lock:
-        logging.info("GET ALL - SUCCESS")
-        return store
+            logging.info(f"Disk data loaded. Current keys: {list(store.keys())}")
+        except:
+            logging.error("Failed to parse data.json")
 
 @app.get("/{key}")
 def get_value(key: str):
-     # prevent the race condition
     with lock:
         if key not in store:
-            logging.info(f"GET {key} - NOT FOUND")
+            logging.info(f"GET {key} - 404 NOT FOUND")
             raise HTTPException(status_code=404, detail="Key not found")
-        
-        logging.info(f"GET {key} - SUCCESS")
-        return {"value": store[key]}
+        logging.info(f"GET {key} - SUCCESS (TS: {store[key]['timestamp']})")
+        return store[key]
 
 @app.post("/{key}")
 def put_value(key: str, item: Item):
-    
-    # prevent the race condition by locking the store during the update
     with lock:
-        store[key] = item.value
-        save_to_disk()
+        existing = store.get(key)
+        # LWW logic: Only update if no existing data OR incoming TS is newer
+        if not existing or item.timestamp > existing.get("timestamp", 0):
+            store[key] = {"value": item.value, "timestamp": item.timestamp}
+            save_to_disk()
+            logging.info(f"PUT {key}, value: {item.value} - UPDATED (New TS: {item.timestamp})")
+            return {"status": "OK"}
         
-    logging.info(f"PUT key: {key}, value: {item.value}")
-    return {"status": "OK"}
+        logging.warning(f"PUT {key}, value: {item.value} - IGNORED (Stale TS: {item.timestamp} < Current: {existing['timestamp']})")
+        return {"status": "Ignored", "reason": "Stale data"}
 
 @app.delete("/{key}")
 def delete_value(key: str):
@@ -82,11 +67,6 @@ def delete_value(key: str):
     logging.info(f"DELETE {key} - SUCCESS")
     return {"status": "Deleted"}
 
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8080,
-        reload=False,
-    )
+@app.get("/")
+def health_check():
+    return {"status": "healthy"}

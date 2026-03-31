@@ -1,0 +1,23 @@
+@startuml
+participant "Proxy (heartbeat_checker)" as Proxy
+participant "ConsistentHashRing" as Ring
+participant "KV Node (Container)" as Node
+
+loop every 1 second
+    Proxy -> Node: GET / (Health Check)
+    
+    alt Node Responds (200 OK)
+        alt Node was previously OFFLINE
+            Proxy -> Ring: add_node(node_url)
+            Note right of Ring: Generates 100 virtual\nreplicas on the ring
+            Proxy -> Proxy: Mark node as ACTIVE
+        end
+    else Connection Failed / Timeout
+        alt Node was previously ACTIVE
+            Proxy -> Ring: remove_node(node_url)
+            Note right of Ring: Removes all virtual\nreplicas from the ring
+            Proxy -> Proxy: Mark node as OFFLINE
+        end
+    end
+end
+@enduml
