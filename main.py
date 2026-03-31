@@ -5,6 +5,8 @@ from storage import store, lock
 import json
 import os
 import requests
+import threading
+import time
 
 from pydantic import BaseModel
 from consistent_hash import ConsistentHashRing
@@ -22,19 +24,84 @@ logging.basicConfig(
 class Item(BaseModel):
     value: str
 
+# clean the string and remove the trailing slash if exists, also remove duplicates while preserving order
+def normalize_nodes(raw_nodes):
+    nodes = [node.strip().rstrip("/") for node in raw_nodes if isinstance(node, str) and node.strip()]
+    deduped = list(dict.fromkeys(nodes))
+    if SELF_NODE not in deduped:
+        deduped.append(SELF_NODE)
+    return deduped
+
+# read the ""NODE_FILE.json" and return the list of nodes. It supports both a JSON list and a JSON object with a "nodes" field.
+def load_nodes_from_file(path: str):
+    with open(path, "r") as f:
+        parsed = json.load(f)
+
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("nodes"), list):
+        return parsed["nodes"]
+
+    raise ValueError("nodes file must be a JSON list or an object with a 'nodes' list")
+
+
 # get the id of SELF_NODE or default http://127.0.0.1:8080
 SELF_NODE = os.getenv("SELF_NODE", "http://127.0.0.1:8080").rstrip("/")
 NODES_ENV = os.getenv("NODES", SELF_NODE)
-NODES = [node.strip().rstrip("/") for node in NODES_ENV.split(",") if node.strip()]
-# ensure the current node is in the list of nodes, if not add it
-if SELF_NODE not in NODES:
-    NODES.append(SELF_NODE)
+NODES = normalize_nodes(NODES_ENV.split(","))
+
+NODES_FILE = os.getenv("NODES_FILE", "").strip()
+NODES_REFRESH_INTERVAL = max(1, int(os.getenv("NODES_REFRESH_INTERVAL", "5")))
 
 # default 50, if bigger, the load will be more balanced but the hash ring will consume more memory and CPU
 VIRTUAL_NODES = int(os.getenv("VIRTUAL_NODES", "50"))
+
+ring_lock = threading.Lock()
 ring = ConsistentHashRing(nodes=NODES, virtual_nodes=VIRTUAL_NODES)
+current_nodes = list(NODES)
 
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
+
+# to define if we need to update the has ring
+def rebuild_ring_if_changed(new_nodes):
+    global ring, current_nodes
+
+    normalized = normalize_nodes(new_nodes)
+    # avoid unnecessary rebuild if the nodes are the same as current
+    if normalized == current_nodes:
+        return False
+
+    new_ring = ConsistentHashRing(nodes=normalized, virtual_nodes=VIRTUAL_NODES)
+    with ring_lock:
+        ring = new_ring
+        current_nodes = normalized
+
+    logging.info("Hash ring updated: nodes=%s", ",".join(current_nodes))
+    return True
+
+
+# Refresh the node list 
+def refresh_nodes_once():
+    if not NODES_FILE:
+        return False
+
+    if not os.path.exists(NODES_FILE):
+        logging.warning("NODES_FILE not found: %s", NODES_FILE)
+        return False
+
+    try:
+        file_nodes = load_nodes_from_file(NODES_FILE)
+        return rebuild_ring_if_changed(file_nodes)
+    except Exception as exc:
+        logging.error("Failed to refresh nodes from %s: %s", NODES_FILE, exc)
+        return False
+
+# use polling to see if the nodes fild has changed
+def nodes_watcher_loop():
+    logging.info("Node watcher started: file=%s interval=%ss", NODES_FILE, NODES_REFRESH_INTERVAL)
+    while True:
+        refresh_nodes_once()
+        time.sleep(NODES_REFRESH_INTERVAL)
 
 
 def save_to_disk():
@@ -43,7 +110,8 @@ def save_to_disk():
 
 
 def key_owner(key: str) -> str:
-    return ring.get_node(key)
+    with ring_lock:
+        return ring.get_node(key)
 
 # Forward the request to the owner node if the current node is not the owner
 def forward_to_owner(method: str, key: str, item: Item = None):
@@ -85,6 +153,24 @@ def forward_to_owner(method: str, key: str, item: Item = None):
 
 app = FastAPI()
 
+# if dynamic node discovery is enabled, start the watcher thread to monitor the nodes file and refresh the hash ring accordingly
+@app.on_event("startup")
+def startup_hook():
+    refresh_nodes_once()
+    if NODES_FILE:
+        watcher = threading.Thread(target=nodes_watcher_loop, daemon=True)
+        watcher.start()
+        
+# for check the cluster nodes and the hash ring status
+@app.get("/cluster/nodes")
+def get_cluster_nodes():
+    return {
+        "self": SELF_NODE,
+        "nodes": current_nodes,
+        "nodes_file": NODES_FILE if NODES_FILE else None,
+        "refresh_interval_seconds": NODES_REFRESH_INTERVAL,
+    }
+
 # for the requirements of Persistence
 # Load existing data if file exists and contains valid JSON
 if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
@@ -93,13 +179,16 @@ if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
             store.update(json.load(f))
         except json.JSONDecodeError:
             logging.warning("data.json is invalid JSON; starting with empty store")
+            
 
 logging.info(
-    "Node started: self=%s nodes=%s virtual_nodes=%s data_file=%s",
+    "Node started: self=%s nodes=%s virtual_nodes=%s data_file=%s nodes_file=%s refresh_interval=%ss",
     SELF_NODE,
-    ",".join(NODES),
+    ",".join(current_nodes),
     VIRTUAL_NODES,
     DATA_FILE,
+    NODES_FILE if NODES_FILE else "disabled",
+    NODES_REFRESH_INTERVAL,
 )
 
 @app.get("/")
