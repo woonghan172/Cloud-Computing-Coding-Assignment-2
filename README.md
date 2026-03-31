@@ -1,5 +1,11 @@
 # Cloud Computing Coding Assignment 2
 
+## System Overview
+
+This project implements a distributed KV store with consistent hashing, embedded proxy forwarding, and Docker Compose based scaling.
+
+![KV Store Architecture](image/kvstore.drawio.png)
+
 ## How To Test (1 -> 3 nodes)
 
 Build image once:
@@ -85,3 +91,7 @@ python benchmark_cluster_plot.py --max-nodes 3
 Outputs:
 - `benchmark_nodes_1_to_3.png`
 - `benchmark_nodes_1_to_3.json`
+
+Benchmark outcome example:
+
+![Benchmark Outcome](image/outcome.png)
