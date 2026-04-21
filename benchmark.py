@@ -1,9 +1,10 @@
 import argparse
 import concurrent.futures
+import random
 import statistics
+from collections import Counter
 import threading
 import time
-from collections import Counter
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -16,6 +17,7 @@ READ_CYCLES = 3
 
 ROUTE_TABLE = {}
 HASH_RING = None
+READ_MODES = {"hash", "random-hop"}
 
 _thread_local = threading.local()
 
@@ -53,6 +55,18 @@ def route_for_key(key: str) -> str:
     except KeyError as exc:
         raise RuntimeError(f"Missing entry URL for owner {owner}") from exc
 
+
+def resolve_read_target(key: str, read_mode: str) -> str:
+    if read_mode == "hash":
+        return route_for_key(key)
+
+    if read_mode == "random-hop":
+        if not ROUTE_TABLE:
+            raise RuntimeError("Route table not initialized. Call init_routing first.")
+        return random.choice(list(ROUTE_TABLE.values()))
+
+    raise ValueError(f"Unsupported read mode: {read_mode}")
+
 def put_key(i, timeout: float):
     key = f"key_{i}"
     data = {"value": f"value_{i}"}
@@ -67,9 +81,9 @@ def put_key(i, timeout: float):
     except Exception:
         return False, 0, base_url
 
-def get_key(i, timeout: float):
+def get_key(i, timeout: float, read_mode: str):
     key = f"key_{i}"
-    base_url = route_for_key(key)
+    base_url = resolve_read_target(key, read_mode)
     start = time.time()
     try:
         response = get_session().get(f"{base_url}/{key}", timeout=timeout)
@@ -85,7 +99,7 @@ def avg(values):
     return (sum(values) / len(values)) if values else 0.0
 
 
-def run_benchmark(timeout: float, workers: int, read_cycles: int):
+def run_benchmark(timeout: float, workers: int, read_cycles: int, read_mode: str):
     # 1. WRITE PHASE
     print(f"--- Phase 1: Writing {NUM_KEYS} keys ---")
     start_time = time.time()
@@ -115,7 +129,9 @@ def run_benchmark(timeout: float, workers: int, read_cycles: int):
 
     # 2. READ PHASE
     total_reads = NUM_KEYS * read_cycles
-    print(f"--- Phase 2: Reading {NUM_KEYS} keys {read_cycles} times ({total_reads} total) ---")
+    print(
+        f"--- Phase 2: Reading {NUM_KEYS} keys {read_cycles} times ({total_reads} total, mode={read_mode}) ---"
+    )
     
     read_latencies = []
     read_success = 0
@@ -126,7 +142,7 @@ def run_benchmark(timeout: float, workers: int, read_cycles: int):
     tasks = list(range(NUM_KEYS)) * read_cycles
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(lambda key: get_key(key, timeout), tasks))
+        results = list(executor.map(lambda key: get_key(key, timeout, read_mode), tasks))
         
     for success, lat, entry in results:
         read_entry_count[entry] += 1
@@ -205,6 +221,12 @@ if __name__ == "__main__":
         help="How many read cycles to run after writes",
     )
     parser.add_argument(
+        "--read-mode",
+        choices=sorted(READ_MODES),
+        default="hash",
+        help="Read routing strategy: hash routes directly to the owner, random-hop picks any entry node first",
+    )
+    parser.add_argument(
         "--base-port",
         type=int,
         default=8081,
@@ -226,13 +248,19 @@ if __name__ == "__main__":
     print("Entry routing table:")
     for owner, entry in sorted(ROUTE_TABLE.items()):
         print(f"  {owner} -> {entry}")
+    print(f"Read mode: {args.read_mode}")
 
     overall_tp = []
     overall_lat = []
 
     for run_idx in range(1, args.runs + 1):
         print(f"\n=== Run {run_idx}/{args.runs} ===")
-        result = run_benchmark(timeout=args.timeout, workers=args.workers, read_cycles=args.read_cycles)
+        result = run_benchmark(
+            timeout=args.timeout,
+            workers=args.workers,
+            read_cycles=args.read_cycles,
+            read_mode=args.read_mode,
+        )
         overall_tp.append(result["overall_throughput"])
         overall_lat.append(result["overall_avg_latency"])
         print(

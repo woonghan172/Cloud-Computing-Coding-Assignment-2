@@ -18,6 +18,7 @@ docker compose build
 ```bash
 NODES_LIST="http://kv1:8080" docker compose up -d kv1
 python benchmark.py --entry-nodes 1 --runs 10 --timeout 5 --workers 6
+python benchmark.py --entry-nodes 1 --runs 10 --timeout 5 --workers 6 --read-mode random-hop
 docker compose down
 ```
 
@@ -25,6 +26,7 @@ docker compose down
 ```bash
 NODES_LIST="http://kv1:8080,http://kv2:8080" docker compose up -d kv1 kv2
 python benchmark.py --entry-nodes 2 --runs 10 --timeout 5 --workers 6
+python benchmark.py --entry-nodes 2 --runs 10 --timeout 5 --workers 6 --read-mode random-hop
 docker compose down
 ```
 
@@ -32,6 +34,7 @@ docker compose down
 ```bash
 NODES_LIST="http://kv1:8080,http://kv2:8080,http://kv3:8080" docker compose up -d kv1 kv2 kv3
 python benchmark.py --entry-nodes 3 --runs 10 --timeout 5 --workers 6
+python benchmark.py --entry-nodes 3 --runs 10 --timeout 5 --workers 6 --read-mode random-hop
 docker compose down
 ```
 
@@ -81,6 +84,8 @@ If the `nodes` field changes in the response, node-change detection is working.
 - `--base-port`: host port for `kv1` (default 8081). Change it only if Docker ports differ.
 - `--virtual-nodes`: default 50 so the client ring mirrors the server configuration. -->
 
+`benchmark.py` also supports `--read-mode hash` to send reads directly to the owner node, or `--read-mode random-hop` to pick a random entry node and let the server forward the request to the owner.
+
 ## Plot Script (1 -> 3 Nodes)
 
 Run the automated 1→N benchmark loop and export throughput/latency plots plus raw JSON:
@@ -88,6 +93,8 @@ Run the automated 1→N benchmark loop and export throughput/latency plots plus 
 ```bash
 python benchmark_cluster_plot.py --max-nodes 3
 ```
+
+Add `--read-mode random-hop` if you want the plot run to measure forwarded reads instead of direct owner reads.
 
 Outputs:
 - `benchmark_nodes_1_to_3.png`

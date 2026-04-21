@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import math
 import os
+import random
 import statistics
 import subprocess
 import threading
@@ -15,6 +16,7 @@ from requests.adapters import HTTPAdapter
 from consistent_hash import ConsistentHashRing
 
 DEFAULT_VIRTUAL_NODES = 50
+READ_MODES = {"hash", "random-hop"}
 
 try:
     import matplotlib.pyplot as plt
@@ -42,6 +44,18 @@ def resolve_entry_url(route_table, ring, key: str) -> str:
         return route_table[owner]
     except KeyError as exc:
         raise RuntimeError(f"Missing entry URL for owner {owner}") from exc
+
+
+def resolve_read_target(route_table, ring, key: str, read_mode: str) -> str:
+    if read_mode == "hash":
+        return resolve_entry_url(route_table, ring, key)
+
+    if read_mode == "random-hop":
+        if not route_table:
+            raise RuntimeError("Route table is empty")
+        return random.choice(list(route_table.values()))
+
+    raise ValueError(f"Unsupported read mode: {read_mode}")
 
 
 _thread_local = threading.local()
@@ -74,9 +88,9 @@ def put_key(route_table, ring, idx: int, timeout: float):
         return False, 0.0
 
 # get the kv pair
-def get_key(route_table, ring, idx: int, timeout: float):
+def get_key(route_table, ring, idx: int, timeout: float, read_mode: str):
     key = f"key_{idx}"
-    base_url = resolve_entry_url(route_table, ring, key)
+    base_url = resolve_read_target(route_table, ring, key, read_mode)
     start = time.time()
     try:
         response = get_session().get(f"{base_url}/{key}", timeout=timeout)
@@ -88,7 +102,7 @@ def get_key(route_table, ring, idx: int, timeout: float):
         return False, 0.0
 
 # two phases: write phase and read phase, both can be parallelized with ThreadPoolExecutor
-def run_workload(route_table, ring, num_keys: int, read_cycles: int, max_workers: int, timeout: float):
+def run_workload(route_table, ring, num_keys: int, read_cycles: int, max_workers: int, timeout: float, read_mode: str):
     # Phase 1 (write) and Phase 2 (read) follow benchmark.py's flow.
     write_latencies = []
     write_success = 0
@@ -110,7 +124,9 @@ def run_workload(route_table, ring, num_keys: int, read_cycles: int, max_workers
     tasks = list(range(num_keys)) * read_cycles
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        read_results = list(executor.map(lambda key: get_key(route_table, ring, key, timeout), tasks))
+        read_results = list(
+            executor.map(lambda key: get_key(route_table, ring, key, timeout, read_mode), tasks)
+        )
 
     for success, latency in read_results:
         if success:
@@ -209,6 +225,10 @@ def plot_results(output_png: Path, x_nodes, throughput_med, throughput_sd, laten
     fig.savefig(output_png, dpi=150)
 
 
+def suffix_output_name(path: Path, suffix: str) -> Path:
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run benchmark for 1..N nodes and draw result plots")
@@ -217,8 +237,14 @@ def main():
     parser.add_argument("--runs", type=int, default=10, help="Benchmark repeats per node count")
     parser.add_argument("--num-keys", type=int, default=300, help="Number of keys in write phase")
     parser.add_argument("--read-cycles", type=int, default=1, help="Read cycles after write phase")
-    parser.add_argument("--workers", type=int, default=10, help="ThreadPool max workers")
-    parser.add_argument("--timeout", type=float, default=2.0, help="HTTP timeout per request")
+    parser.add_argument(
+        "--read-mode",
+        choices=sorted(READ_MODES),
+        default="hash",
+        help="Read routing strategy: hash routes directly to the owner, random-hop picks any entry node first",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="ThreadPool max workers")
+    parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout per request")
     parser.add_argument("--settle-seconds", type=float, default=2.0, help="Wait time after compose up")
     parser.add_argument("--output", default="benchmark_nodes_1_to_3.png", help="Output plot filename")
     parser.add_argument("--output-json", default="benchmark_nodes_1_to_3.json", help="Output raw result JSON")
@@ -232,6 +258,7 @@ def main():
     latency_medians = []
     latency_sds = []
     raw = {}
+    print(f"Read mode: {args.read_mode}")
 
     for node_count in range(1, args.max_nodes + 1):
         print(f"\n=== Node count: {node_count} ===")
@@ -255,6 +282,7 @@ def main():
                     read_cycles=args.read_cycles,
                     max_workers=args.workers,
                     timeout=args.timeout,
+                    read_mode=args.read_mode,
                 )
                 node_runs.append(result)
                 throughputs.append(result["overall_throughput"])
@@ -284,6 +312,12 @@ def main():
 
     output_png = work_dir / args.output
     output_json = work_dir / args.output_json
+
+    if args.output == "benchmark_nodes_1_to_3.png":
+        output_png = suffix_output_name(output_png, args.read_mode.replace("-", "_"))
+
+    if args.output_json == "benchmark_nodes_1_to_3.json":
+        output_json = suffix_output_name(output_json, args.read_mode.replace("-", "_"))
 
     plot_results(
         output_png=output_png,
