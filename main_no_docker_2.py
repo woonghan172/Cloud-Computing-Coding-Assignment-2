@@ -68,7 +68,7 @@ ring_lock = threading.Lock()
 ring = ConsistentHashRing(nodes=NODES, virtual_nodes=VIRTUAL_NODES)
 current_nodes = list(NODES)
 
-DATA_FILE = os.getenv("DATA_FILE", "data.json")
+DATA_FILE = os.getenv("DATA_FILE", f"data_{SELF_NODE_PORT}.json")
 
 # to define if we need to update the has ring
 def rebuild_ring_if_changed(new_nodes):
