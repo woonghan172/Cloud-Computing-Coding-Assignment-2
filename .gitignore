@@ -4,3 +4,7 @@ logger.log
 data.json
 benchmark_nodes_1_to_3.json
 benchmark_nodes_1_to_3.png
+.venv/
+data_8081.json
+data_8082.json
+data_8083.json
