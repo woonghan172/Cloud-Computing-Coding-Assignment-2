@@ -20,12 +20,12 @@ READ_MODES = {"hash", "random-hop"}
 node_ips = ["http://127.0.0.1", "http://127.0.0.1", "http://127.0.0.1"]
 node_ports = ["8081", "8082", "8083"]
 
-try:
-    import matplotlib.pyplot as plt
-except Exception as exc:  # pragma: no cover
-    raise SystemExit(
-        "matplotlib is required for plotting. Install it with: pip install matplotlib"
-    ) from exc
+# try:
+#     import matplotlib.pyplot as plt
+# except Exception as exc:  # pragma: no cover
+#     raise SystemExit(
+#         "matplotlib is required for plotting. Install it with: pip install matplotlib"
+#     ) from exc
 
 # ring: to find the owner node for a key
 # route_table: to find the entry URL for an owner node
