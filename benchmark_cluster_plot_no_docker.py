@@ -71,10 +71,14 @@ def put_key(ring, idx: int, timeout: float):
     key = f"key_{idx}"
     data = {"value": f"value_{idx}"}
     base_url = resolve_entry_url(ring, key)
-    start = time.time()
+    #####################
+    start = time.time() # TIMER START
+    #####################
     try:
         response = get_session().post(f"{base_url}/{key}", json=data, timeout=timeout)
-        latency = time.time() - start
+        ###############################
+        latency = time.time() - start # TIMER END
+        ###############################
         success = response.status_code == 200
         response.close()
         return success, latency
@@ -85,10 +89,14 @@ def put_key(ring, idx: int, timeout: float):
 def get_key(ring, idx: int, timeout: float, read_mode: str):
     key = f"key_{idx}"
     base_url = resolve_read_target(ring, key, read_mode)
-    start = time.time()
+    #####################
+    start = time.time() # TIMER START
+    #####################
     try:
         response = get_session().get(f"{base_url}/{key}", timeout=timeout)
-        latency = time.time() - start
+        ###############################
+        latency = time.time() - start # TIMER END
+        ###############################
         success = response.status_code == 200
         response.close()
         return success, latency
@@ -100,34 +108,47 @@ def run_workload(ring, num_keys: int, read_cycles: int, max_workers: int, timeou
     # Phase 1 (write) and Phase 2 (read) follow benchmark.py's flow.
     write_latencies = []
     write_success = 0
-    write_start = time.time()
+
+    ###########################
+    write_start = time.time() # TIMER START
+    ###########################
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         write_results = list(executor.map(lambda i: put_key(ring, i, timeout), range(num_keys)))
 
+    #########################################################
+    write_total_time = max(time.time() - write_start, 1e-9) # TIMER END
+    #########################################################
+    
     for success, latency in write_results:
         if success:
             write_success += 1
             write_latencies.append(latency)
 
-    write_total_time = max(time.time() - write_start, 1e-9)
 
     read_latencies = []
     read_success = 0
-    read_start = time.time()
-    tasks = list(range(num_keys)) * read_cycles
+    #tasks = list(range(num_keys)) * read_cycles
+    tasks = list(range(num_keys))
+    
+    ###########################
+    read_start = time.time()  # TIMER START
+    ###########################
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         read_results = list(
             executor.map(lambda key: get_key(ring, key, timeout, read_mode), tasks)
         )
 
+    #######################################################
+    read_total_time = max(time.time() - read_start, 1e-9) # TIMER END
+    #######################################################
+    
     for success, latency in read_results:
         if success:
             read_success += 1
             read_latencies.append(latency)
 
-    read_total_time = max(time.time() - read_start, 1e-9)
 
     total_success = write_success + read_success
     total_time = max(write_total_time + read_total_time, 1e-9)
@@ -162,10 +183,9 @@ def main():
     # before this, the kv stores should be up
 
     parser = argparse.ArgumentParser(description="Run benchmark for 1..N nodes and draw result plots")
-    parser.add_argument("--base-port", type=int, default=8081, help="Host port of kv1 entrypoint")
     parser.add_argument("--max-nodes", type=int, default=3, help="Maximum node count to test")
-    parser.add_argument("--runs", type=int, default=10, help="Benchmark repeats per node count")
-    parser.add_argument("--num-keys", type=int, default=300, help="Number of keys in write phase")
+    parser.add_argument("--runs", type=int, default=1, help="Benchmark repeats per node count")
+    parser.add_argument("--num-keys", type=int, default=1000, help="Number of keys in write phase")
     parser.add_argument("--read-cycles", type=int, default=1, help="Read cycles after write phase")
     parser.add_argument(
         "--read-mode",
@@ -173,11 +193,9 @@ def main():
         default="random-hop",
         help="Read routing strategy: hash routes directly to the owner, random-hop picks any entry node first",
     )
-    parser.add_argument("--workers", type=int, default=6, help="ThreadPool max workers")
+    parser.add_argument("--workers", type=int, default=9, help="ThreadPool max workers")
     parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout per request")
-    parser.add_argument("--settle-seconds", type=float, default=2.0, help="Wait time after compose up")
-    parser.add_argument("--output", default="benchmark_nodes_1_to_3.png", help="Output plot filename")
-    parser.add_argument("--output-json", default="benchmark_nodes_1_to_3.json", help="Output raw result JSON")
+
     args = parser.parse_args()
 
     work_dir = Path(__file__).resolve().parent
@@ -188,18 +206,13 @@ def main():
     latency_medians = []
     latency_sds = []
     raw = {}
-    print(f"Read mode: {args.read_mode}")
 
-    #for node_count in range(1, args.max_nodes + 1):
     node_count = 3
-
-    print(f"\n=== Node count: {node_count} ===")
 
     ring = ConsistentHashRing(NODES, virtual_nodes=DEFAULT_VIRTUAL_NODES)
 
     throughputs = []
     latencies = []
-    node_runs = []
 
     for run_idx in range(1, args.runs + 1):
         result = run_workload(
@@ -210,22 +223,24 @@ def main():
             timeout=args.timeout,
             read_mode=args.read_mode,
         )
-        node_runs.append(result)
         throughputs.append(result["overall_throughput"])
         latencies.append(result["overall_avg_latency"])
-        print(
-            f"Run {run_idx}: overall_throughput={result['overall_throughput']:.2f} req/s, "
-            f"overall_avg_latency={result['overall_avg_latency']:.5f}s, "
-            f"write_fail={result['write_fail']}, read_fail={result['read_fail']}"
-        )
+        # print(
+        #     f"Run {run_idx}: overall_throughput={result['overall_throughput']:.2f} req/s, "
+        #     f"overall_avg_latency={result['overall_avg_latency']:.5f}s, "
+        #     f"write_fail={result['write_fail']}, read_fail={result['read_fail']}"
+        # )
 
     t_med, t_sd = stats(throughputs)
     l_med, l_sd = stats(latencies)
 
+    print("======================================================================================================================")
     print(
         f"Summary n={node_count}: throughput median={t_med:.2f} sd={t_sd:.2f}, "
         f"latency median={l_med:.5f}s sd={l_sd:.5f}s"
+        f", num of threads: {args.workers}"
     )
+    print("======================================================================================================================")
 
 if __name__ == "__main__":
     main()
