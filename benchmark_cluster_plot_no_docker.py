@@ -17,45 +17,37 @@ from consistent_hash import ConsistentHashRing
 
 DEFAULT_VIRTUAL_NODES = 50
 READ_MODES = {"hash", "random-hop"}
-node_ips = ["http://127.0.0.1", "http://127.0.0.1", "http://127.0.0.1"]
-node_ports = ["8081", "8082", "8083"]
+NODES_FILE = "nodes.json"
 
-# try:
-#     import matplotlib.pyplot as plt
-# except Exception as exc:  # pragma: no cover
-#     raise SystemExit(
-#         "matplotlib is required for plotting. Install it with: pip install matplotlib"
-#     ) from exc
+def load_nodes_from_file(path: str):
+    with open(path, "r") as f:
+        parsed = json.load(f)
 
-# ring: to find the owner node for a key
-# route_table: to find the entry URL for an owner node
-def build_routing_table(node_count: int, base_port: int, virtual_nodes: int):
-    if node_count < 1:
-        raise ValueError("node_count must be >= 1")
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("nodes"), list):
+        return parsed["nodes"]
 
-    nodes = [f"{node_ip}:{port}" for node_ip, port in zip(node_ips, node_ports)]
-    entry_urls = [f"{node_ip}:{port}" for node_ip, port in zip(node_ips, node_ports)]
-    ring = ConsistentHashRing(nodes=nodes, virtual_nodes=virtual_nodes)
-    route_table = dict(zip(nodes, entry_urls))
-    return ring, route_table
+    raise ValueError("nodes file must be a JSON list or an object with a 'nodes' list")
+
+NODES = load_nodes_from_file(NODES_FILE)
 
 # compute which entry URL to send the request for a given key
-def resolve_entry_url(route_table, ring, key: str) -> str:
-    owner = ring.get_node(key)
+def resolve_entry_url(ring, key: str) -> str:
     try:
-        return route_table[owner]
+        return ring.get_node(key)
     except KeyError as exc:
-        raise RuntimeError(f"Missing entry URL for owner {owner}") from exc
+        raise RuntimeError(f"Missing entry URL for owner of {key}") from exc
 
 
-def resolve_read_target(route_table, ring, key: str, read_mode: str) -> str:
+def resolve_read_target(ring, key: str, read_mode: str) -> str:
     if read_mode == "hash":
-        return resolve_entry_url(route_table, ring, key)
+        return resolve_entry_url(ring, key)
 
     if read_mode == "random-hop":
-        if not route_table:
-            raise RuntimeError("Route table is empty")
-        return random.choice(list(route_table.values()))
+        if len(NODES) == 0:
+            raise RuntimeError("Node table is empty")
+        return random.choice(NODES)
 
     raise ValueError(f"Unsupported read mode: {read_mode}")
 
@@ -75,10 +67,10 @@ def get_session():
     return session
 
 # write a key-value pair
-def put_key(route_table, ring, idx: int, timeout: float):
+def put_key(ring, idx: int, timeout: float):
     key = f"key_{idx}"
     data = {"value": f"value_{idx}"}
-    base_url = resolve_entry_url(route_table, ring, key)
+    base_url = resolve_entry_url(ring, key)
     start = time.time()
     try:
         response = get_session().post(f"{base_url}/{key}", json=data, timeout=timeout)
@@ -90,9 +82,9 @@ def put_key(route_table, ring, idx: int, timeout: float):
         return False, 0.0
 
 # get the kv pair
-def get_key(route_table, ring, idx: int, timeout: float, read_mode: str):
+def get_key(ring, idx: int, timeout: float, read_mode: str):
     key = f"key_{idx}"
-    base_url = resolve_read_target(route_table, ring, key, read_mode)
+    base_url = resolve_read_target(ring, key, read_mode)
     start = time.time()
     try:
         response = get_session().get(f"{base_url}/{key}", timeout=timeout)
@@ -104,14 +96,14 @@ def get_key(route_table, ring, idx: int, timeout: float, read_mode: str):
         return False, 0.0
 
 # two phases: write phase and read phase, both can be parallelized with ThreadPoolExecutor
-def run_workload(route_table, ring, num_keys: int, read_cycles: int, max_workers: int, timeout: float, read_mode: str):
+def run_workload(ring, num_keys: int, read_cycles: int, max_workers: int, timeout: float, read_mode: str):
     # Phase 1 (write) and Phase 2 (read) follow benchmark.py's flow.
     write_latencies = []
     write_success = 0
     write_start = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        write_results = list(executor.map(lambda i: put_key(route_table, ring, i, timeout), range(num_keys)))
+        write_results = list(executor.map(lambda i: put_key(ring, i, timeout), range(num_keys)))
 
     for success, latency in write_results:
         if success:
@@ -127,7 +119,7 @@ def run_workload(route_table, ring, num_keys: int, read_cycles: int, max_workers
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         read_results = list(
-            executor.map(lambda key: get_key(route_table, ring, key, timeout, read_mode), tasks)
+            executor.map(lambda key: get_key(ring, key, timeout, read_mode), tasks)
         )
 
     for success, latency in read_results:
@@ -203,17 +195,14 @@ def main():
 
     print(f"\n=== Node count: {node_count} ===")
 
-    ring, route_table = build_routing_table(node_count, args.base_port, DEFAULT_VIRTUAL_NODES)
-    print("Routing table:")
-    for owner, entry in sorted(route_table.items()):
-        print(f"  {owner} -> {entry}")
+    ring = ConsistentHashRing(NODES, virtual_nodes=DEFAULT_VIRTUAL_NODES)
+
     throughputs = []
     latencies = []
     node_runs = []
 
     for run_idx in range(1, args.runs + 1):
         result = run_workload(
-            route_table=route_table,
             ring=ring,
             num_keys=args.num_keys,
             read_cycles=args.read_cycles,

@@ -18,7 +18,7 @@ import logging
 
 SELF_NODE = ""
 DATA_FILE = ""
-NODES = ""
+NODES = []
 NODES_FILE = os.getenv("NODES_FILE", "nodes.json").strip()
 
 # default 50, if bigger, the load will be more balanced but the hash ring will consume more memory and CPU
