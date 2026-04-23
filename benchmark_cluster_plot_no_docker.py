@@ -165,52 +165,6 @@ def stats(values):
         return filtered[0], 0.0
     return statistics.median(filtered), statistics.stdev(filtered)
 
-
-# for the graph
-def plot_results(output_png: Path, x_nodes, throughput_med, throughput_sd, latency_med, latency_sd):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    axes[0].errorbar(
-        x_nodes,
-        throughput_med,
-        yerr=throughput_sd,
-        fmt="o-",
-        color="blue",
-        ecolor="blue",
-        capsize=6,
-        label="Median + SD",
-    )
-    axes[0].set_title("Throughput vs Cluster Size")
-    axes[0].set_xlabel("Number of Nodes")
-    axes[0].set_ylabel("Requests / Second")
-    axes[0].grid(True, linestyle="--", alpha=0.5)
-    axes[0].legend()
-
-    axes[1].errorbar(
-        x_nodes,
-        latency_med,
-        yerr=latency_sd,
-        fmt="s-",
-        color="red",
-        ecolor="red",
-        capsize=6,
-        label="Median + SD",
-    )
-    axes[1].set_title("Latency vs Cluster Size")
-    axes[1].set_xlabel("Number of Nodes")
-    axes[1].set_ylabel("Avg Latency (Seconds)")
-    axes[1].grid(True, linestyle="--", alpha=0.5)
-    axes[1].legend()
-
-    fig.tight_layout()
-    fig.savefig(output_png, dpi=150)
-
-
-def suffix_output_name(path: Path, suffix: str) -> Path:
-    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
-
-
-
 def main():
 
     # before this, the kv stores should be up
@@ -257,7 +211,6 @@ def main():
     latencies = []
     node_runs = []
 
-
     for run_idx in range(1, args.runs + 1):
         result = run_workload(
             route_table=route_table,
@@ -280,53 +233,10 @@ def main():
     t_med, t_sd = stats(throughputs)
     l_med, l_sd = stats(latencies)
 
-    x_nodes.append(node_count)
-    throughput_medians.append(t_med)
-    throughput_sds.append(t_sd)
-    latency_medians.append(l_med)
-    latency_sds.append(l_sd)
-    raw[str(node_count)] = node_runs
-
     print(
         f"Summary n={node_count}: throughput median={t_med:.2f} sd={t_sd:.2f}, "
         f"latency median={l_med:.5f}s sd={l_sd:.5f}s"
     )
-
-    # output_png = work_dir / args.output
-    # output_json = work_dir / args.output_json
-
-    # if args.output == "benchmark_nodes_1_to_3.png":
-    #     output_png = suffix_output_name(output_png, args.read_mode.replace("-", "_"))
-
-    # if args.output_json == "benchmark_nodes_1_to_3.json":
-    #     output_json = suffix_output_name(output_json, args.read_mode.replace("-", "_"))
-
-    # plot_results(
-    #     output_png=output_png,
-    #     x_nodes=x_nodes,
-    #     throughput_med=throughput_medians,
-    #     throughput_sd=throughput_sds,
-    #     latency_med=latency_medians,
-    #     latency_sd=latency_sds,
-    # )
-
-    # with open(output_json, "w") as f:
-    #     json.dump(
-    #         {
-    #             "x_nodes": x_nodes,
-    #             "throughput_median": throughput_medians,
-    #             "throughput_sd": throughput_sds,
-    #             "latency_median": latency_medians,
-    #             "latency_sd": latency_sds,
-    #             "raw": raw,
-    #         },
-    #         f,
-    #         indent=2,
-    #     )
-
-    # print(f"\nSaved plot: {output_png}")
-    # print(f"Saved raw stats: {output_json}")
-
 
 if __name__ == "__main__":
     main()
