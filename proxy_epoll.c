@@ -6,10 +6,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdint.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 4096
 #define MAX_STORAGES 3
-#define RING_VIRTUAL_NODES 10 // Number of virtual nodes per physical storage
+#define RING_VIRTUAL_NODES 10
+#define MAX_EVENTS 100
 
 struct StorageConfig {
     int id;
@@ -38,7 +42,13 @@ struct __attribute__((packed)) MsgHeader {
     uint32_t val_len;
 };
 
-// Compute hash value
+// Set socket to non-blocking mode
+int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 uint32_t compute_hash(const char *str) {
     unsigned long hash = 5381;
     int c;
@@ -48,7 +58,6 @@ uint32_t compute_hash(const char *str) {
     return (uint32_t)hash;
 }
 
-// Compare nodes for sorting the hash ring
 int compare_nodes(const void *a, const void *b) {
     struct RingNode *nodeA = (struct RingNode *)a;
     struct RingNode *nodeB = (struct RingNode *)b;
@@ -57,44 +66,33 @@ int compare_nodes(const void *a, const void *b) {
     return 0;
 }
 
-// Initialize consistent hash ring
 void init_hash_ring(struct ProxyConfig *config) {
     config->ring_size = 0;
     for (int i = 0; i < config->storage_count; i++) {
         for (int v = 0; v < RING_VIRTUAL_NODES; v++) {
             char vnode_key[128];
             snprintf(vnode_key, sizeof(vnode_key), "node-%d-vnode-%d", config->storages[i].id, v);
-            
             config->ring[config->ring_size].position = compute_hash(vnode_key);
             config->ring[config->ring_size].storage_idx = i;
             config->ring_size++;
         }
     }
-    // Sort ring by position
     qsort(config->ring, config->ring_size, sizeof(struct RingNode), compare_nodes);
 }
 
-// Get the closest node on the consistent hash ring
 int get_storage_index(const char *key, const struct ProxyConfig *config) {
     uint32_t key_pos = compute_hash(key);
-    
-    // Binary or linear search on the ring
     for (int i = 0; i < config->ring_size; i++) {
         if (config->ring[i].position >= key_pos) {
             return config->ring[i].storage_idx;
         }
     }
-    
-    // Wrap around the ring
     return config->ring[0].storage_idx;
 }
 
 int load_config(const char *filename, struct ProxyConfig *config) {
     FILE *file = fopen(filename, "r");
-    if (!file) {
-        perror("Failed to open config.txt");
-        return -1;
-    }
+    if (!file) return -1;
 
     char line[256];
     config->storage_count = 0;
@@ -112,7 +110,6 @@ int load_config(const char *filename, struct ProxyConfig *config) {
                 int id = atoi(key + 8);
                 char ip[64];
                 int port;
-
                 if (sscanf(value, "%63[^:]:%d", ip, &port) == 2) {
                     if (config->storage_count < MAX_STORAGES) {
                         config->storages[config->storage_count].id = id;
@@ -129,57 +126,61 @@ int load_config(const char *filename, struct ProxyConfig *config) {
     return 0;
 }
 
-int forward_to_storage(const struct StorageConfig *storage, uint8_t cmd, const char *key, const char *val, char *out_buf, size_t *out_len) {
-    int sock_fd;
-    struct sockaddr_in addr;
+// Handler for the event loop connection
+void handle_client(int client_fd, struct ProxyConfig *config) {
+    struct MsgHeader header;
+    ssize_t n = read(client_fd, &header, sizeof(header));
+    if (n != sizeof(header)) return;
 
-    if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        return -1;
+    char key[256] = {0};
+    char val[4096] = {0};
+
+    if (header.key_len > 0 && header.key_len < sizeof(key)) {
+        read(client_fd, key, header.key_len);
+    }
+    if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
+        read(client_fd, val, header.val_len);
     }
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(storage->port);
-    addr.sin_addr.s_addr = inet_addr(storage->ip);
+    int storage_idx = get_storage_index(key, config);
+    int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_fd < 0) return;
 
-    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    struct sockaddr_in s_addr;
+    s_addr.sin_family = AF_INET;
+    s_addr.sin_port = htons(config->storages[storage_idx].port);
+    s_addr.sin_addr.s_addr = inet_addr(config->storages[storage_idx].ip);
+
+    if (connect(sock_fd, (struct sockaddr *)&s_addr, sizeof(s_addr)) < 0) {
         close(sock_fd);
-        return -1;
+        return;
     }
-
-    uint16_t key_len = key ? strlen(key) : 0;
-    uint32_t val_len = val ? strlen(val) : 0;
-
-    struct MsgHeader header = {
-        .magic = 0x4B,
-        .command = cmd,
-        .key_len = key_len,
-        .val_len = val_len
-    };
 
     write(sock_fd, &header, sizeof(header));
-    if (key_len > 0) write(sock_fd, key, key_len);
-    if (cmd == 0x02 && val_len > 0) write(sock_fd, val, val_len);
+    if (header.key_len > 0) write(sock_fd, key, header.key_len);
+    if (header.command == 0x02 && header.val_len > 0) write(sock_fd, val, header.val_len);
 
     uint8_t status;
     if (read(sock_fd, &status, 1) <= 0) {
         close(sock_fd);
-        return -1;
+        return;
     }
 
-    if (cmd == 0x01 && status == 0x00) {
+    write(client_fd, &status, 1);
+
+    if (header.command == 0x01 && status == 0x00) {
         uint32_t read_val_len = 0;
         if (read(sock_fd, &read_val_len, sizeof(read_val_len)) == sizeof(read_val_len)) {
-            *out_len = read_val_len;
-            if (read_val_len > 0 && read_val_len < BUFFER_SIZE) {
-                ssize_t n = read(sock_fd, out_buf, read_val_len);
-                if (n > 0) out_buf[n] = '\0';
-                //printf("[proxy][get request] key: %s / get output: %s \n", key, out_buf);
+            char resp_buf[4096] = {0};
+            ssize_t r_len = read(sock_fd, resp_buf, read_val_len);
+            if (r_len > 0) {
+                write(client_fd, &read_val_len, sizeof(read_val_len));
+                write(client_fd, resp_buf, r_len);
             }
         }
     }
-
     close(sock_fd);
-    return status;
+    close(client_fd);
 }
 
 int main() {
@@ -189,10 +190,8 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    int server_fd;
-    struct sockaddr_in addr;
-
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
         perror("Proxy: Socket failed");
         exit(EXIT_FAILURE);
     }
@@ -200,6 +199,7 @@ int main() {
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr(config.bind_ip);
     addr.sin_port = htons(config.port);
@@ -210,45 +210,52 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) == -1) {
+    if (listen(server_fd, SOMAXCONN) == -1) {
         perror("Proxy: Listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("Proxy listening on port %d with consistent hashing...\n", config.port);
+    set_nonblocking(server_fd);
+
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event ev, events[MAX_EVENTS];
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.fd = server_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
+        perror("epoll_ctl: server_fd");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Non-blocking epoll Proxy listening on port %d with consistent hashing...\n", config.port);
 
     while (1) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) continue;
-
-        struct MsgHeader header;
-        if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
-            char key[256] = {0};
-            char val[4096] = {0};
-
-            if (header.key_len > 0 && header.key_len < sizeof(key)) {
-                read(client_fd, key, header.key_len);
-            }
-            if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-                read(client_fd, val, header.val_len);
-            }
-
-            int storage_idx = get_storage_index(key, &config);
-            char resp_buf[4096] = {0};
-            uint32_t resp_len = 0;
-
-            int status = forward_to_storage(&config.storages[storage_idx], header.command, key, val, resp_buf, &resp_len);
-
-            write(client_fd, &status, 1);
-            if (header.command == 0x01 && status == 0x00) {
-                write(client_fd, &resp_len, sizeof(resp_len));
-                write(client_fd, resp_buf, resp_len);
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == server_fd) {
+                while (1) {
+                    struct sockaddr_in client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                    if (client_fd == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; // Flushed all incoming connections
+                        }
+                        break;
+                    }
+                    set_nonblocking(client_fd);
+                    handle_client(client_fd, &config);
+                }
             }
         }
-        close(client_fd);
     }
 
     close(server_fd);
+    close(epoll_fd);
     return 0;
 }
