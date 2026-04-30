@@ -6,18 +6,21 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdint.h>
+#include <pthread.h>
 
-#define MAX_ENTRIES 1024*1024
 #define KEY_SIZE 256
 #define VAL_SIZE 4096
+#define TABLE_SIZE 10000 // Number of buckets in the hash table
 
 struct KeyValue {
     char key[KEY_SIZE];
     char value[VAL_SIZE];
-    int used;
+    struct KeyValue *next;
 };
 
-struct KeyValue db[MAX_ENTRIES];
+// Protect the hash table across multiple worker threads
+pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct KeyValue *hash_table[TABLE_SIZE];
 
 struct __attribute__((packed)) MsgHeader {
     uint8_t magic;
@@ -26,45 +29,123 @@ struct __attribute__((packed)) MsgHeader {
     uint32_t val_len;
 };
 
+unsigned long hash_function(const char *str) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c; 
+    }
+    return hash % TABLE_SIZE;
+}
+
 void kv_set(const char *key, const char *value) {
-    for (int i = 0; i < MAX_ENTRIES; i++) {
-        if (db[i].used && strcmp(db[i].key, key) == 0) {
-            strncpy(db[i].value, value, VAL_SIZE - 1);
+    pthread_mutex_lock(&hash_mutex);
+    unsigned long index = hash_function(key);
+    struct KeyValue *entry = hash_table[index];
+
+    while (entry != NULL) {
+        if (strcmp(entry->key, key) == 0) {
+            strncpy(entry->value, value, VAL_SIZE - 1);
+            pthread_mutex_unlock(&hash_mutex);
             return;
         }
+        entry = entry->next;
     }
-    for (int i = 0; i < MAX_ENTRIES; i++) {
-        if (!db[i].used) {
-            strncpy(db[i].key, key, KEY_SIZE - 1);
-            strncpy(db[i].value, value, VAL_SIZE - 1);
-            db[i].used = 1;
-            return;
-        }
-    }
+
+    struct KeyValue *new_entry = (struct KeyValue *)malloc(sizeof(struct KeyValue));
+    strncpy(new_entry->key, key, KEY_SIZE - 1);
+    strncpy(new_entry->value, value, VAL_SIZE - 1);
+    new_entry->next = hash_table[index];
+    hash_table[index] = new_entry;
+    pthread_mutex_unlock(&hash_mutex);
 }
 
 int kv_get(const char *key, char *out_val, size_t *out_len) {
-    for (int i = 0; i < MAX_ENTRIES; i++) {
-        if (db[i].used && strcmp(db[i].key, key) == 0) {
-            size_t len = strlen(db[i].value);
-            strncpy(out_val, db[i].value, VAL_SIZE - 1);
+    pthread_mutex_lock(&hash_mutex);
+    unsigned long index = hash_function(key);
+    struct KeyValue *entry = hash_table[index];
+
+    while (entry != NULL) {
+        if (strcmp(entry->key, key) == 0) {
+            size_t len = strlen(entry->value);
+            strncpy(out_val, entry->value, VAL_SIZE - 1);
             *out_len = len;
-            return 0;
+            pthread_mutex_unlock(&hash_mutex);
+            return 0; // Found
         }
+        entry = entry->next;
     }
-    return 1;
+    pthread_mutex_unlock(&hash_mutex);
+    return 1; // Not found
 }
 
 int kv_del(const char *key) {
-    for (int i = 0; i < MAX_ENTRIES; i++) {
-        if (db[i].used && strcmp(db[i].key, key) == 0) {
-            db[i].used = 0;
-            db[i].key[0] = '\0';
-            db[i].value[0] = '\0';
-            return 0;
+    pthread_mutex_lock(&hash_mutex);
+    unsigned long index = hash_function(key);
+    struct KeyValue *entry = hash_table[index];
+    struct KeyValue *prev = NULL;
+
+    while (entry != NULL) {
+        if (strcmp(entry->key, key) == 0) {
+            if (prev == NULL) {
+                hash_table[index] = entry->next;
+            } else {
+                prev->next = entry->next;
+            }
+            free(entry);
+            pthread_mutex_unlock(&hash_mutex);
+            return 0; // Deleted
+        }
+        prev = entry;
+        entry = entry->next;
+    }
+    pthread_mutex_unlock(&hash_mutex);
+    return 1; // Not found
+}
+
+// Thread-worker to handle each client
+void *handle_client(void *arg) {
+    int client_fd = *((int *)arg);
+    free(arg);
+
+    struct MsgHeader header;
+    if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
+        char key[KEY_SIZE] = {0};
+        char val[VAL_SIZE] = {0};
+
+        if (header.key_len > 0 && header.key_len < sizeof(key)) {
+            read(client_fd, key, header.key_len);
+        }
+        if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
+            read(client_fd, val, header.val_len);
+        }
+
+        if (header.command == 0x01) {
+            char out_val[VAL_SIZE];
+            size_t out_len = 0;
+            int res = kv_get(key, out_val, &out_len);
+            if (res == 0) {
+                uint8_t status = 0x00;
+                write(client_fd, &status, 1);
+                uint32_t send_len = (uint32_t)out_len;
+                write(client_fd, &send_len, sizeof(send_len));
+                write(client_fd, out_val, send_len);
+            } else {
+                uint8_t status = 0x01;
+                write(client_fd, &status, 1);
+            }
+        } else if (header.command == 0x02) {
+            kv_set(key, val);
+            uint8_t status = 0x00;
+            write(client_fd, &status, 1);
+        } else if (header.command == 0x03) {
+            int res = kv_del(key);
+            uint8_t status = (res == 0) ? 0x00 : 0x01;
+            write(client_fd, &status, 1);
         }
     }
-    return 1;
+    close(client_fd);
+    return NULL;
 }
 
 int load_storage_config(const char *filename, int storage_id, char *out_ip, int *out_port) {
@@ -97,6 +178,10 @@ int load_storage_config(const char *filename, int storage_id, char *out_ip, int 
 }
 
 int main(int argc, char *argv[]) {
+    for (int i = 0; i < TABLE_SIZE; i++) {
+        hash_table[i] = NULL;
+    }
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <storage_id>\nExample: %s 1\n", argv[0], argv[0]);
         exit(EXIT_FAILURE);
@@ -131,56 +216,24 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) == -1) {
+    if (listen(server_fd, SOMAXCONN) == -1) {
         perror("Storage: Listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("Storage engine (ID: %d) listening on %s:%d\n", storage_id, ip, port);
+    printf("Threaded Storage Engine (ID: %d) listening on %s:%d\n", storage_id, ip, port);
 
     while (1) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
 
-        struct MsgHeader header;
-        if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
-            char key[KEY_SIZE] = {0};
-            char val[VAL_SIZE] = {0};
+        int *client_sock = malloc(sizeof(int));
+        *client_sock = client_fd;
 
-            if (header.key_len > 0 && header.key_len < sizeof(key)) {
-                read(client_fd, key, header.key_len);
-            }
-            if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-                read(client_fd, val, header.val_len);
-            }
-
-            if (header.command == 0x01) {
-                char out_val[VAL_SIZE];
-                size_t out_len = 0;
-                int res = kv_get(key, out_val, &out_len);
-                //printf("[storage] get request - key: %s / val: %s \n",key, out_val);
-                if (res == 0) {
-                    uint8_t status = 0x00;
-                    write(client_fd, &status, 1);
-                    uint32_t send_len = (uint32_t)out_len;
-                    write(client_fd, &send_len, sizeof(send_len));
-                    write(client_fd, out_val, send_len);
-                } else {
-                    uint8_t status = 0x01;
-                    write(client_fd, &status, 1);
-                }
-            } else if (header.command == 0x02) {
-                kv_set(key, val);
-                uint8_t status = 0x00;
-                write(client_fd, &status, 1);
-            } else if (header.command == 0x03) {
-                int res = kv_del(key);
-                uint8_t status = (res == 0) ? 0x00 : 0x01;
-                write(client_fd, &status, 1);
-            }
-        }
-        close(client_fd);
+        pthread_t thread_id;
+        pthread_create(&thread_id, NULL, handle_client, client_sock);
+        pthread_detach(thread_id); // Clean up thread automatically when finished
     }
     close(server_fd);
     return 0;
