@@ -132,7 +132,29 @@ int load_config(const char *filename, struct ProxyConfig *config) {
     init_hash_ring(config);
     return 0;
 }
+ssize_t read_all(int fd, void *buffer, size_t length) {
+    size_t total_read = 0;
 
+    while (total_read < length) {
+        ssize_t n = read(fd, (char *)buffer + total_read, length - total_read);
+        if (n <= 0) return -1;
+        total_read += (size_t)n;
+    }
+
+    return (ssize_t)total_read;
+}
+
+ssize_t write_all(int fd, const void *buffer, size_t length) {
+    size_t total_written = 0;
+
+    while (total_written < length) {
+        ssize_t n = write(fd, (const char *)buffer + total_written, length - total_written);
+        if (n <= 0) return -1;
+        total_written += (size_t)n;
+    }
+
+    return (ssize_t)total_written;
+}
 int forward_to_storage(const struct StorageConfig *storage, uint8_t cmd, const char *key, const char *val, char *out_buf, size_t *out_len) {
     int sock_fd;
     struct sockaddr_in addr;
@@ -160,22 +182,22 @@ int forward_to_storage(const struct StorageConfig *storage, uint8_t cmd, const c
         .val_len = val_len
     };
 
-    write(sock_fd, &header, sizeof(header));
-    if (key_len > 0) write(sock_fd, key, key_len);
-    if (cmd == 0x02 && val_len > 0) write(sock_fd, val, val_len);
+    write_all(sock_fd, &header, sizeof(header));
+    if (key_len > 0) write_all(sock_fd, key, key_len);
+    if (cmd == 0x02 && val_len > 0) write_all(sock_fd, val, val_len);
 
     uint8_t status;
-    if (read(sock_fd, &status, 1) <= 0) {
+    if (read_all(sock_fd, &status, 1) <= 0) {
         close(sock_fd);
         return -1;
     }
 
     if (cmd == 0x01 && status == 0x00) {
         uint32_t read_val_len = 0;
-        if (read(sock_fd, &read_val_len, sizeof(read_val_len)) == sizeof(read_val_len)) {
+        if (read_all(sock_fd, &read_val_len, sizeof(read_val_len)) == sizeof(read_val_len)) {
             *out_len = read_val_len;
             if (read_val_len > 0 && read_val_len < BUFFER_SIZE) {
-                ssize_t n = read(sock_fd, out_buf, read_val_len);
+                ssize_t n = read_all(sock_fd, out_buf, read_val_len);
                 if (n > 0) out_buf[n] = '\0';
                 //printf("[proxy][get request] key: %s / get output: %s \n", key, out_buf);
             }
@@ -190,15 +212,15 @@ void *handle_client(void *arg){
     free(arg);
 
     struct MsgHeader header;
-    if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
+    if (read_all(client_fd, &header, sizeof(header)) == sizeof(header)) {
         char key[256] = {0};
         char val[4096] = {0};
 
         if (header.key_len > 0 && header.key_len < sizeof(key)) {
-            read(client_fd, key, header.key_len);
+            read_all(client_fd, key, header.key_len);
         }
         if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-            read(client_fd, val, header.val_len);
+            read_all(client_fd, val, header.val_len);
         }
 
         int storage_idx = get_storage_index(key, &config);
@@ -207,10 +229,10 @@ void *handle_client(void *arg){
 
         int status = forward_to_storage(&config.storages[storage_idx], header.command, key, val, resp_buf, &resp_len);
 
-        write(client_fd, &status, 1);
+        write_all(client_fd, &status, 1);
         if (header.command == 0x01 && status == 0x00) {
-            write(client_fd, &resp_len, sizeof(resp_len));
-            write(client_fd, resp_buf, resp_len);
+            write_all(client_fd, &resp_len, sizeof(resp_len));
+            write_all(client_fd, resp_buf, resp_len);
         }
     }
 

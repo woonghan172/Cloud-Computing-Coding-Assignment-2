@@ -165,7 +165,29 @@ int load_storage_config(const char *filename, int storage_id, char *out_ip, int 
     fclose(file);
     return -1;
 }
+ssize_t read_all(int fd, void *buffer, size_t length) {
+    size_t total_read = 0;
 
+    while (total_read < length) {
+        ssize_t n = read(fd, (char *)buffer + total_read, length - total_read);
+        if (n <= 0) return -1;
+        total_read += (size_t)n;
+    }
+
+    return (ssize_t)total_read;
+}
+
+ssize_t write_all(int fd, const void *buffer, size_t length) {
+    size_t total_written = 0;
+
+    while (total_written < length) {
+        ssize_t n = write(fd, (const char *)buffer + total_written, length - total_written);
+        if (n <= 0) return -1;
+        total_written += (size_t)n;
+    }
+
+    return (ssize_t)total_written;
+}
 int main(int argc, char *argv[]) {
     init_hash_table();
 
@@ -216,15 +238,15 @@ int main(int argc, char *argv[]) {
         if (client_fd < 0) continue;
 
         struct MsgHeader header;
-        if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
+        if (read_all(client_fd, &header, sizeof(header)) == sizeof(header)) {
             char key[KEY_SIZE] = {0};
             char val[VAL_SIZE] = {0};
 
             if (header.key_len > 0 && header.key_len < sizeof(key)) {
-                read(client_fd, key, header.key_len);
+                read_all(client_fd, key, header.key_len);
             }
             if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-                read(client_fd, val, header.val_len);
+                read_all(client_fd, val, header.val_len);
             }
 
             if (header.command == 0x01) {
@@ -234,22 +256,22 @@ int main(int argc, char *argv[]) {
                 //printf("[storage] get request - key: %s / val: %s \n",key, out_val);
                 if (res == 0) {
                     uint8_t status = 0x00;
-                    write(client_fd, &status, 1);
+                    write_all(client_fd, &status, 1);
                     uint32_t send_len = (uint32_t)out_len;
-                    write(client_fd, &send_len, sizeof(send_len));
-                    write(client_fd, out_val, send_len);
+                    write_all(client_fd, &send_len, sizeof(send_len));
+                    write_all(client_fd, out_val, send_len);
                 } else {
                     uint8_t status = 0x01;
-                    write(client_fd, &status, 1);
+                    write_all(client_fd, &status, 1);
                 }
             } else if (header.command == 0x02) {
                 kv_set(key, val);
                 uint8_t status = 0x00;
-                write(client_fd, &status, 1);
+                write_all(client_fd, &status, 1);
             } else if (header.command == 0x03) {
                 int res = kv_del(key);
                 uint8_t status = (res == 0) ? 0x00 : 0x01;
-                write(client_fd, &status, 1);
+                write_all(client_fd, &status, 1);
             }
         }
         close(client_fd);
