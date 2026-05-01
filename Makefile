@@ -4,10 +4,10 @@ CFLAGS = -Wall -Wextra -O2 -w
 all: proxy storage benchmark
 
 proxy: proxy.c
-	$(CC) $(CFLAGS) proxy.c -o proxy
+	$(CC) $(CFLAGS) proxy.c -o proxy -pthread
 
 storage: storage.c
-	$(CC) $(CFLAGS) storage.c -o storage
+	$(CC) $(CFLAGS) storage.c -o storage -pthread
 
 benchmark: benchmark.c
 	$(CC) $(CFLAGS) benchmark.c -o benchmark

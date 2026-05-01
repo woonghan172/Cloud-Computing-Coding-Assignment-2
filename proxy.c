@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #define BUFFER_SIZE 4096
 #define MAX_STORAGES 3
@@ -16,6 +17,8 @@ struct StorageConfig {
     char ip[64];
     int port;
 };
+
+struct ProxyConfig config;
 
 struct RingNode {
     uint32_t position;
@@ -181,9 +184,39 @@ int forward_to_storage(const struct StorageConfig *storage, uint8_t cmd, const c
     close(sock_fd);
     return status;
 }
+void *handle_client(void *arg){
+    int client_fd = *(int *)arg;
+    free(arg);
 
+    struct MsgHeader header;
+    if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
+        char key[256] = {0};
+        char val[4096] = {0};
+
+        if (header.key_len > 0 && header.key_len < sizeof(key)) {
+            read(client_fd, key, header.key_len);
+        }
+        if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
+            read(client_fd, val, header.val_len);
+        }
+
+        int storage_idx = get_storage_index(key, &config);
+        char resp_buf[4096] = {0};
+        uint32_t resp_len = 0;
+
+        int status = forward_to_storage(&config.storages[storage_idx], header.command, key, val, resp_buf, &resp_len);
+
+        write(client_fd, &status, 1);
+        if (header.command == 0x01 && status == 0x00) {
+            write(client_fd, &resp_len, sizeof(resp_len));
+            write(client_fd, resp_buf, resp_len);
+        }
+    }
+
+    close(client_fd);
+    return;
+}
 int main() {
-    struct ProxyConfig config;
     if (load_config("config.txt", &config) != 0) {
         fprintf(stderr, "Failed to load config.txt\n");
         exit(EXIT_FAILURE);
@@ -222,31 +255,12 @@ int main() {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
 
-        struct MsgHeader header;
-        if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
-            char key[256] = {0};
-            char val[4096] = {0};
+        int *pclient = malloc(sizeof(int));
+        *pclient = client_fd;
 
-            if (header.key_len > 0 && header.key_len < sizeof(key)) {
-                read(client_fd, key, header.key_len);
-            }
-            if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-                read(client_fd, val, header.val_len);
-            }
-
-            int storage_idx = get_storage_index(key, &config);
-            char resp_buf[4096] = {0};
-            uint32_t resp_len = 0;
-
-            int status = forward_to_storage(&config.storages[storage_idx], header.command, key, val, resp_buf, &resp_len);
-
-            write(client_fd, &status, 1);
-            if (header.command == 0x01 && status == 0x00) {
-                write(client_fd, &resp_len, sizeof(resp_len));
-                write(client_fd, resp_buf, resp_len);
-            }
-        }
-        close(client_fd);
+        pthread_t tid;
+        pthread_create(&tid, NULL, handle_client, pclient);
+        pthread_detach(tid);
     }
 
     close(server_fd);
