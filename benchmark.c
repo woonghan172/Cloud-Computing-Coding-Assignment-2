@@ -11,6 +11,8 @@
 #define NUM_WORKERS 4
 #define NUM_WRITES 500
 #define NUM_READS 500
+#define TOTAL_OPERATION_NUM 1000
+int operation_num_per_thread;
 
 struct __attribute__((packed)) MsgHeader {
     uint8_t magic;
@@ -74,7 +76,7 @@ ssize_t read_all(int socket_fd, void *buffer, size_t length) {
     return total_read;
 }
 
-void *benchmark_worker(void *arg) {
+void *benchmark_worker(void *arg, int operation_num) {
     struct ThreadArg *t_arg = (struct ThreadArg *)arg;
     int worker_id = t_arg->worker_id;
     struct ProxyAddress proxy = t_arg->proxy;
@@ -86,7 +88,7 @@ void *benchmark_worker(void *arg) {
 
     // --- WRITE PHASE ---
     long long total_write_time = 0;
-    for (int i = 0; i < NUM_WRITES; i++) {
+    for (int i = 0; i < operation_num_per_thread; i++) {
         int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (sock_fd < 0) continue;
 
@@ -128,7 +130,7 @@ void *benchmark_worker(void *arg) {
     
     // --- READ PHASE ---
     long long total_read_time = 0;
-    for (int i = 0; i < NUM_READS; i++) {
+    for (int i = 0; i < operation_num_per_thread; i++) {
         int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (sock_fd < 0) continue;
         
@@ -186,6 +188,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    operation_num_per_thread = TOTAL_OPERATION_NUM / num_workers;
+
     struct ProxyAddress proxy;
     if (load_proxy_address("config.txt", &proxy) != 0) {
         fprintf(stderr, "Failed to parse config.txt. Using defaults (127.0.0.1:8080).\n");
@@ -199,7 +203,7 @@ int main(int argc, char *argv[]) {
     struct ThreadArg args[num_workers];
 
     printf("Starting benchmark with %d workers, %d writes and %d reads per worker...\n\n",
-           num_workers, NUM_WRITES, NUM_READS);
+           num_workers, operation_num_per_thread, operation_num_per_thread);
 
     long long total_start_time = get_time_ms();
 
