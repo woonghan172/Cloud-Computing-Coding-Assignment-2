@@ -18,7 +18,6 @@ struct StorageConfig {
     int port;
 };
 
-struct ProxyConfig config;
 
 struct RingNode {
     uint32_t position;
@@ -33,6 +32,8 @@ struct ProxyConfig {
     struct RingNode ring[MAX_STORAGES * RING_VIRTUAL_NODES];
     int ring_size;
 };
+
+struct ProxyConfig config;
 
 struct __attribute__((packed)) MsgHeader {
     uint8_t magic;
@@ -214,7 +215,7 @@ void *handle_client(void *arg){
     }
 
     close(client_fd);
-    return;
+    return NULL;
 }
 int main() {
     if (load_config("config.txt", &config) != 0) {
@@ -243,7 +244,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) == -1) {
+    if (listen(server_fd, 1024) == -1) {
         perror("Proxy: Listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -256,10 +257,18 @@ int main() {
         if (client_fd < 0) continue;
 
         int *pclient = malloc(sizeof(int));
+        if (pclient == NULL) {
+            close(client_fd);
+            continue;
+        }
         *pclient = client_fd;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, handle_client, pclient);
+        if (pthread_create(&tid, NULL, handle_client, pclient) != 0) {
+            close(client_fd);
+            free(pclient);
+            continue;
+        }
         pthread_detach(tid);
     }
 
