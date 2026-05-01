@@ -6,10 +6,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdint.h>
+#include <pthread.h>
 
-#define MAX_ENTRIES 1024*1024
+
+#define MAX_ENTRIES 1024
 #define KEY_SIZE 256
 #define VAL_SIZE 4096
+
+pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct KeyValue {
     char key[KEY_SIZE];
@@ -96,6 +100,66 @@ int load_storage_config(const char *filename, int storage_id, char *out_ip, int 
     return -1;
 }
 
+void *handle_client(void *arg) {
+    int client_fd = *(int *)arg;
+    free(arg);
+
+    struct MsgHeader header;
+
+    if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
+        char key[KEY_SIZE] = {0};
+        char val[VAL_SIZE] = {0};
+
+        if (header.key_len > 0 && header.key_len < sizeof(key)) {
+            read(client_fd, key, header.key_len);
+        }
+
+        if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
+            read(client_fd, val, header.val_len);
+        }
+
+        if (header.command == 0x01) {
+            char out_val[VAL_SIZE];
+            size_t out_len = 0;
+
+            pthread_mutex_lock(&db_mutex);
+            int res = kv_get(key, out_val, &out_len);
+            pthread_mutex_unlock(&db_mutex);
+
+            if (res == 0) {
+                uint8_t status = 0x00;
+                write(client_fd, &status, 1);
+
+                uint32_t send_len = (uint32_t)out_len;
+                write(client_fd, &send_len, sizeof(send_len));
+                write(client_fd, out_val, send_len);
+            } else {
+                uint8_t status = 0x01;
+                write(client_fd, &status, 1);
+            }
+
+        } else if (header.command == 0x02) {
+            pthread_mutex_lock(&db_mutex);
+            kv_set(key, val);
+            pthread_mutex_unlock(&db_mutex);
+
+            uint8_t status = 0x00;
+            write(client_fd, &status, 1);
+
+        } else if (header.command == 0x03) {
+            pthread_mutex_lock(&db_mutex);
+            int res = kv_del(key);
+            pthread_mutex_unlock(&db_mutex);
+
+            uint8_t status = (res == 0) ? 0x00 : 0x01;
+            write(client_fd, &status, 1);
+        }
+    }
+
+    close(client_fd);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <storage_id>\nExample: %s 1\n", argv[0], argv[0]);
@@ -131,7 +195,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) == -1) {
+    if (listen(server_fd, 1024) == -1) {
         perror("Storage: Listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -143,44 +207,22 @@ int main(int argc, char *argv[]) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
 
-        struct MsgHeader header;
-        if (read(client_fd, &header, sizeof(header)) == sizeof(header)) {
-            char key[KEY_SIZE] = {0};
-            char val[VAL_SIZE] = {0};
-
-            if (header.key_len > 0 && header.key_len < sizeof(key)) {
-                read(client_fd, key, header.key_len);
-            }
-            if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-                read(client_fd, val, header.val_len);
-            }
-
-            if (header.command == 0x01) {
-                char out_val[VAL_SIZE];
-                size_t out_len = 0;
-                int res = kv_get(key, out_val, &out_len);
-                //printf("[storage] get request - key: %s / val: %s \n",key, out_val);
-                if (res == 0) {
-                    uint8_t status = 0x00;
-                    write(client_fd, &status, 1);
-                    uint32_t send_len = (uint32_t)out_len;
-                    write(client_fd, &send_len, sizeof(send_len));
-                    write(client_fd, out_val, send_len);
-                } else {
-                    uint8_t status = 0x01;
-                    write(client_fd, &status, 1);
-                }
-            } else if (header.command == 0x02) {
-                kv_set(key, val);
-                uint8_t status = 0x00;
-                write(client_fd, &status, 1);
-            } else if (header.command == 0x03) {
-                int res = kv_del(key);
-                uint8_t status = (res == 0) ? 0x00 : 0x01;
-                write(client_fd, &status, 1);
-            }
+        int *pclient = malloc(sizeof(int));
+        if (pclient == NULL) {
+            close(client_fd);
+            continue;
         }
-        close(client_fd);
+
+        *pclient = client_fd;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, pclient) != 0) {
+            close(client_fd);
+            free(pclient);
+            continue;
+        }
+
+        pthread_detach(tid);
     }
     close(server_fd);
     return 0;
