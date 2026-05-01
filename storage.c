@@ -188,6 +188,76 @@ ssize_t write_all(int fd, const void *buffer, size_t length) {
 
     return (ssize_t)total_written;
 }
+
+void *handle_client(void *arg) {
+    int client_fd = *(int *)arg;
+    free(arg);
+
+    struct MsgHeader header;
+    if (read_all(client_fd, &header, sizeof(header)) == sizeof(header)) {
+        char key[KEY_SIZE] = {0};
+        char val[VAL_SIZE] = {0};
+
+        if (header.magic != 0x4B) {
+            close(client_fd);
+            return NULL;
+        }
+
+        if (header.key_len > 0 && header.key_len < sizeof(key)) {
+            if (read_all(client_fd, key, header.key_len) < 0) {
+                close(client_fd);
+                return NULL;
+            }
+            key[header.key_len] = '\0';
+        } else {
+            close(client_fd);
+            return NULL;
+        }
+
+        if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
+            if (read_all(client_fd, val, header.val_len) < 0) {
+                close(client_fd);
+                return NULL;
+            }
+            val[header.val_len] = '\0';
+        }
+
+        if (header.command == 0x01) {
+            char out_val[VAL_SIZE];
+            size_t out_len = 0;
+            int res = kv_get(key, out_val, &out_len);
+
+            if (res == 0) {
+                uint8_t status = 0x00;
+                write_all(client_fd, &status, 1);
+
+                uint32_t send_len = (uint32_t)out_len;
+                write_all(client_fd, &send_len, sizeof(send_len));
+                write_all(client_fd, out_val, send_len);
+            } else {
+                uint8_t status = 0x01;
+                write_all(client_fd, &status, 1);
+            }
+        } else if (header.command == 0x02) {
+            kv_set(key, val);
+
+            uint8_t status = 0x00;
+            write_all(client_fd, &status, 1);
+        } else if (header.command == 0x03) {
+            int res = kv_del(key);
+
+            uint8_t status = (res == 0) ? 0x00 : 0x01;
+            write_all(client_fd, &status, 1);
+        } else {
+            uint8_t status = 0x01;
+            write_all(client_fd, &status, 1);
+        }
+    }
+
+    close(client_fd);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     init_hash_table();
 
@@ -225,7 +295,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) == -1) {
+    if (listen(server_fd, 1024) == -1) {
         perror("Storage: Listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -237,44 +307,22 @@ int main(int argc, char *argv[]) {
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) continue;
 
-        struct MsgHeader header;
-        if (read_all(client_fd, &header, sizeof(header)) == sizeof(header)) {
-            char key[KEY_SIZE] = {0};
-            char val[VAL_SIZE] = {0};
-
-            if (header.key_len > 0 && header.key_len < sizeof(key)) {
-                read_all(client_fd, key, header.key_len);
-            }
-            if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-                read_all(client_fd, val, header.val_len);
-            }
-
-            if (header.command == 0x01) {
-                char out_val[VAL_SIZE];
-                size_t out_len = 0;
-                int res = kv_get(key, out_val, &out_len);
-                //printf("[storage] get request - key: %s / val: %s \n",key, out_val);
-                if (res == 0) {
-                    uint8_t status = 0x00;
-                    write_all(client_fd, &status, 1);
-                    uint32_t send_len = (uint32_t)out_len;
-                    write_all(client_fd, &send_len, sizeof(send_len));
-                    write_all(client_fd, out_val, send_len);
-                } else {
-                    uint8_t status = 0x01;
-                    write_all(client_fd, &status, 1);
-                }
-            } else if (header.command == 0x02) {
-                kv_set(key, val);
-                uint8_t status = 0x00;
-                write_all(client_fd, &status, 1);
-            } else if (header.command == 0x03) {
-                int res = kv_del(key);
-                uint8_t status = (res == 0) ? 0x00 : 0x01;
-                write_all(client_fd, &status, 1);
-            }
+        int *pclient = malloc(sizeof(int));
+        if (pclient == NULL) {
+            close(client_fd);
+            continue;
         }
-        close(client_fd);
+
+        *pclient = client_fd;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, pclient) != 0) {
+            close(client_fd);
+            free(pclient);
+            continue;
+        }
+
+        pthread_detach(tid);
     }
     close(server_fd);
     return 0;
