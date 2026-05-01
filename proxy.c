@@ -1,299 +1,395 @@
+/*
+ * proxy.c  –  Optimized consistent-hashing proxy
+ *
+ * Key improvements over original:
+ *  - Fixed thread pool (no per-connection pthread_create)
+ *  - Per-storage TCP connection pool (reuse connections, avoid 3-way handshakes)
+ *  - Binary search on consistent hash ring  (O(log n) vs O(n))
+ *  - writev() to send header+key+val in one syscall
+ *  - TCP_NODELAY on both client and storage sockets
+ *  - SO_REUSEPORT on accept socket
+ *  - Proper error handling on all read_all paths in handle_client
+ */
+
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <semaphore.h>
 
-#define BUFFER_SIZE 4096
-#define MAX_STORAGES 3
-#define RING_VIRTUAL_NODES 10 // Number of virtual nodes per physical storage
+/* ── tunables ──────────────────────────────────────────────────── */
+#define BUFFER_SIZE       4096
+#define MAX_STORAGES      16
+#define RING_VIRTUAL_NODES 150   /* more vnodes → better balance    */
+#define THREAD_POOL_SIZE   32
+#define QUEUE_CAPACITY    8192
+#define CONN_POOL_SIZE     16    /* persistent conns per storage    */
+/* ──────────────────────────────────────────────────────────────── */
 
-struct StorageConfig {
-    int id;
-    char ip[64];
-    int port;
-};
-
-
-struct RingNode {
-    uint32_t position;
-    int storage_idx;
-};
-
-struct ProxyConfig {
-    char bind_ip[64];
-    int port;
-    struct StorageConfig storages[MAX_STORAGES];
-    int storage_count;
-    struct RingNode ring[MAX_STORAGES * RING_VIRTUAL_NODES];
-    int ring_size;
-};
-
-struct ProxyConfig config;
-
+/* ── wire protocol ─────────────────────────────────────────────── */
 struct __attribute__((packed)) MsgHeader {
-    uint8_t magic;
-    uint8_t command;
+    uint8_t  magic;
+    uint8_t  command;
     uint16_t key_len;
     uint32_t val_len;
 };
 
-// Compute hash value
-uint32_t compute_hash(const char *str) {
-    unsigned long hash = 5381;
-    int c;
-    while ((c = *str++)) {
-        hash = ((hash << 5) + hash) + c;
+/* ── storage config ────────────────────────────────────────────── */
+struct StorageConfig {
+    int  id;
+    char ip[64];
+    int  port;
+};
+
+/* ── connection pool ───────────────────────────────────────────── */
+struct ConnPool {
+    int             fds[CONN_POOL_SIZE];
+    pthread_mutex_t lock;
+    int             count;          /* number of available (idle) fds */
+    char            ip[64];
+    int             port;
+};
+
+/* ── consistent hash ring ──────────────────────────────────────── */
+struct RingNode {
+    uint32_t position;
+    int      storage_idx;
+};
+
+/* ── proxy config ──────────────────────────────────────────────── */
+struct ProxyConfig {
+    char              bind_ip[64];
+    int               port;
+    struct StorageConfig storages[MAX_STORAGES];
+    int               storage_count;
+    struct RingNode   ring[MAX_STORAGES * RING_VIRTUAL_NODES];
+    int               ring_size;
+    struct ConnPool   pools[MAX_STORAGES];
+};
+
+static struct ProxyConfig g_config;
+
+/* ── helpers ───────────────────────────────────────────────────── */
+static uint32_t compute_hash(const char *s) {
+    uint32_t h = 5381;
+    unsigned char c;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) ^ c;
+    return h;
+}
+
+static ssize_t read_all(int fd, void *buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = read(fd, (char*)buf + done, len - done);
+        if (n <= 0) return -1;
+        done += (size_t)n;
     }
-    return (uint32_t)hash;
+    return (ssize_t)done;
 }
 
-// Compare nodes for sorting the hash ring
-int compare_nodes(const void *a, const void *b) {
-    struct RingNode *nodeA = (struct RingNode *)a;
-    struct RingNode *nodeB = (struct RingNode *)b;
-    if (nodeA->position < nodeB->position) return -1;
-    if (nodeA->position > nodeB->position) return 1;
-    return 0;
+static ssize_t write_all(int fd, const void *buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, (const char*)buf + done, len - done);
+        if (n <= 0) return -1;
+        done += (size_t)n;
+    }
+    return (ssize_t)done;
 }
 
-// Initialize consistent hash ring
-void init_hash_ring(struct ProxyConfig *config) {
-    config->ring_size = 0;
-    for (int i = 0; i < config->storage_count; i++) {
+/* ── consistent hash ring ──────────────────────────────────────── */
+static int cmp_ring(const void *a, const void *b) {
+    const struct RingNode *x = a, *y = b;
+    return (x->position > y->position) - (x->position < y->position);
+}
+
+static void init_hash_ring(struct ProxyConfig *cfg) {
+    cfg->ring_size = 0;
+    for (int i = 0; i < cfg->storage_count; i++) {
         for (int v = 0; v < RING_VIRTUAL_NODES; v++) {
-            char vnode_key[128];
-            snprintf(vnode_key, sizeof(vnode_key), "node-%d-vnode-%d", config->storages[i].id, v);
-            
-            config->ring[config->ring_size].position = compute_hash(vnode_key);
-            config->ring[config->ring_size].storage_idx = i;
-            config->ring_size++;
+            char key[128];
+            snprintf(key, sizeof(key), "node-%d-vnode-%d", cfg->storages[i].id, v);
+            cfg->ring[cfg->ring_size].position    = compute_hash(key);
+            cfg->ring[cfg->ring_size].storage_idx = i;
+            cfg->ring_size++;
         }
     }
-    // Sort ring by position
-    qsort(config->ring, config->ring_size, sizeof(struct RingNode), compare_nodes);
+    qsort(cfg->ring, cfg->ring_size, sizeof(struct RingNode), cmp_ring);
 }
 
-// Get the closest node on the consistent hash ring
-int get_storage_index(const char *key, const struct ProxyConfig *config) {
-    uint32_t key_pos = compute_hash(key);
-    
-    // Binary or linear search on the ring
-    for (int i = 0; i < config->ring_size; i++) {
-        if (config->ring[i].position >= key_pos) {
-            return config->ring[i].storage_idx;
-        }
+/* Binary search – O(log n) */
+static int get_storage_index(const char *key, const struct ProxyConfig *cfg) {
+    uint32_t pos = compute_hash(key);
+    int lo = 0, hi = cfg->ring_size - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (cfg->ring[mid].position < pos) lo = mid + 1;
+        else                                hi = mid;
     }
-    
-    // Wrap around the ring
-    return config->ring[0].storage_idx;
+    /* If pos > all positions, wrap around to first node */
+    if (cfg->ring[lo].position < pos) lo = 0;
+    return cfg->ring[lo].storage_idx;
 }
 
-int load_config(const char *filename, struct ProxyConfig *config) {
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        perror("Failed to open config.txt");
-        return -1;
-    }
-
-    char line[256];
-    config->storage_count = 0;
-
-    while (fgets(line, sizeof(line), file)) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
-
-        char key[64], value[128];
-        if (sscanf(line, "%63[^=]=%127[^\n]", key, value) == 2) {
-            if (strcmp(key, "PROXY_IP") == 0) {
-                strncpy(config->bind_ip, value, sizeof(config->bind_ip) - 1);
-            } else if (strcmp(key, "PROXY_PORT") == 0) {
-                config->port = atoi(value);
-            } else if (strncmp(key, "STORAGE_", 8) == 0) {
-                int id = atoi(key + 8);
-                char ip[64];
-                int port;
-
-                if (sscanf(value, "%63[^:]:%d", ip, &port) == 2) {
-                    if (config->storage_count < MAX_STORAGES) {
-                        config->storages[config->storage_count].id = id;
-                        strncpy(config->storages[config->storage_count].ip, ip, sizeof(config->storages[config->storage_count].ip) - 1);
-                        config->storages[config->storage_count].port = port;
-                        config->storage_count++;
-                    }
-                }
-            }
-        }
-    }
-    fclose(file);
-    init_hash_ring(config);
-    return 0;
-}
-ssize_t read_all(int fd, void *buffer, size_t length) {
-    size_t total_read = 0;
-
-    while (total_read < length) {
-        ssize_t n = read(fd, (char *)buffer + total_read, length - total_read);
-        if (n <= 0) return -1;
-        total_read += (size_t)n;
-    }
-
-    return (ssize_t)total_read;
+/* ── connection pool ───────────────────────────────────────────── */
+static void pool_init(struct ConnPool *p, const char *ip, int port) {
+    pthread_mutex_init(&p->lock, NULL);
+    p->count = 0;
+    strncpy(p->ip, ip, sizeof(p->ip) - 1);
+    p->port = port;
+    for (int i = 0; i < CONN_POOL_SIZE; i++) p->fds[i] = -1;
 }
 
-ssize_t write_all(int fd, const void *buffer, size_t length) {
-    size_t total_written = 0;
-
-    while (total_written < length) {
-        ssize_t n = write(fd, (const char *)buffer + total_written, length - total_written);
-        if (n <= 0) return -1;
-        total_written += (size_t)n;
+static int new_storage_conn(const char *ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    struct sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(port),
+        .sin_addr.s_addr = inet_addr(ip),
+    };
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd); return -1;
     }
-
-    return (ssize_t)total_written;
+    return fd;
 }
-int forward_to_storage(const struct StorageConfig *storage, uint8_t cmd, const char *key, const char *val, char *out_buf, size_t *out_len) {
-    int sock_fd;
-    struct sockaddr_in addr;
 
-    if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        return -1;
+/* Borrow a connection from the pool (or open a fresh one). */
+static int pool_acquire(struct ConnPool *p) {
+    pthread_mutex_lock(&p->lock);
+    if (p->count > 0) {
+        int fd = p->fds[--p->count];
+        pthread_mutex_unlock(&p->lock);
+        return fd;
     }
+    pthread_mutex_unlock(&p->lock);
+    return new_storage_conn(p->ip, p->port);
+}
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(storage->port);
-    addr.sin_addr.s_addr = inet_addr(storage->ip);
-
-    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        close(sock_fd);
-        return -1;
+/* Return a healthy connection to the pool, or close it if pool is full. */
+static void pool_release(struct ConnPool *p, int fd) {
+    pthread_mutex_lock(&p->lock);
+    if (p->count < CONN_POOL_SIZE) {
+        p->fds[p->count++] = fd;
+        pthread_mutex_unlock(&p->lock);
+    } else {
+        pthread_mutex_unlock(&p->lock);
+        close(fd);
     }
+}
 
-    uint16_t key_len = key ? strlen(key) : 0;
-    uint32_t val_len = val ? strlen(val) : 0;
+/* ── forward request to storage ────────────────────────────────── */
+static int forward_to_storage(int storage_idx, uint8_t cmd,
+                               const char *key, const char *val,
+                               char *out_buf, uint32_t *out_len) {
+    struct ConnPool *pool = &g_config.pools[storage_idx];
+    int fd = pool_acquire(pool);
+    if (fd < 0) return -1;
 
-    struct MsgHeader header = {
-        .magic = 0x4B,
+    uint16_t key_len = key ? (uint16_t)strlen(key) : 0;
+    uint32_t val_len = val ? (uint32_t)strlen(val) : 0;
+
+    struct MsgHeader hdr = {
+        .magic   = 0x4B,
         .command = cmd,
         .key_len = key_len,
-        .val_len = val_len
+        .val_len = val_len,
     };
 
-    write_all(sock_fd, &header, sizeof(header));
-    if (key_len > 0) write_all(sock_fd, key, key_len);
-    if (cmd == 0x02 && val_len > 0) write_all(sock_fd, val, val_len);
+    /* Send header + key + val in one writev call */
+    struct iovec iov[3];
+    int niov = 0;
+    iov[niov++] = (struct iovec){ &hdr,        sizeof(hdr) };
+    if (key_len) iov[niov++] = (struct iovec){ (void*)key, key_len  };
+    if (cmd == 0x02 && val_len)
+                 iov[niov++] = (struct iovec){ (void*)val, val_len  };
+    if (writev(fd, iov, niov) < 0) { close(fd); return -1; }
 
     uint8_t status;
-    if (read_all(sock_fd, &status, 1) <= 0) {
-        close(sock_fd);
-        return -1;
-    }
+    if (read_all(fd, &status, 1) < 0) { close(fd); return -1; }
 
     if (cmd == 0x01 && status == 0x00) {
-        uint32_t read_val_len = 0;
-        if (read_all(sock_fd, &read_val_len, sizeof(read_val_len)) == sizeof(read_val_len)) {
-            *out_len = read_val_len;
-            if (read_val_len > 0 && read_val_len < BUFFER_SIZE) {
-                ssize_t n = read_all(sock_fd, out_buf, read_val_len);
-                if (n > 0) out_buf[n] = '\0';
-                //printf("[proxy][get request] key: %s / get output: %s \n", key, out_buf);
+        uint32_t rlen = 0;
+        if (read_all(fd, &rlen, sizeof(rlen)) < 0) { close(fd); return -1; }
+        *out_len = rlen;
+        if (rlen > 0 && rlen < BUFFER_SIZE) {
+            if (read_all(fd, out_buf, rlen) < 0) { close(fd); return -1; }
+            out_buf[rlen] = '\0';
+        }
+    }
+
+    pool_release(pool, fd);   /* return healthy connection */
+    return (int)status;
+}
+
+/* ── thread pool ───────────────────────────────────────────────── */
+static int      q_buf[QUEUE_CAPACITY];
+static int      q_head = 0, q_tail = 0;
+static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t           q_sem;
+
+static void q_push(int fd) {
+    pthread_mutex_lock(&q_lock);
+    q_buf[q_tail] = fd;
+    q_tail = (q_tail + 1) % QUEUE_CAPACITY;
+    pthread_mutex_unlock(&q_lock);
+    sem_post(&q_sem);
+}
+
+static int q_pop(void) {
+    sem_wait(&q_sem);
+    pthread_mutex_lock(&q_lock);
+    int fd = q_buf[q_head];
+    q_head = (q_head + 1) % QUEUE_CAPACITY;
+    pthread_mutex_unlock(&q_lock);
+    return fd;
+}
+
+/* ── client handler ────────────────────────────────────────────── */
+static void handle_client(int client_fd) {
+    int one = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    struct MsgHeader hdr;
+    if (read_all(client_fd, &hdr, sizeof(hdr)) < 0) goto done;
+    if (hdr.magic != 0x4B) goto done;
+    if (hdr.key_len == 0 || hdr.key_len >= 256) goto done;
+
+    char key[256]         = {0};
+    char val[BUFFER_SIZE] = {0};
+
+    if (read_all(client_fd, key, hdr.key_len) < 0) goto done;
+    key[hdr.key_len] = '\0';
+
+    if (hdr.command == 0x02) {
+        if (hdr.val_len == 0 || hdr.val_len >= BUFFER_SIZE) goto done;
+        if (read_all(client_fd, val, hdr.val_len) < 0)       goto done;
+        val[hdr.val_len] = '\0';
+    }
+
+    int storage_idx      = get_storage_index(key, &g_config);
+    char resp_buf[BUFFER_SIZE] = {0};
+    uint32_t resp_len    = 0;
+
+    int status = forward_to_storage(storage_idx, hdr.command,
+                                    key, val, resp_buf, &resp_len);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+    if (status < 0) { uint8_t e = 0x01; (void)write(client_fd, &e, 1); goto done; }
+#pragma GCC diagnostic pop
+
+    if (hdr.command == 0x01 && status == 0x00) {
+        struct iovec iov[3] = {
+            { &status,   1               },
+            { &resp_len, sizeof(uint32_t)},
+            { resp_buf,  resp_len        },
+        };
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-result"
+        (void)writev(client_fd, iov, 3);
+#pragma GCC diagnostic pop
+    } else {
+        write_all(client_fd, &status, 1);
+    }
+
+done:
+    close(client_fd);
+}
+
+static void *worker_thread(void *arg) {
+    (void)arg;
+    for (;;) handle_client(q_pop());
+    return NULL;
+}
+
+/* ── config loader ─────────────────────────────────────────────── */
+static int load_config(const char *filename, struct ProxyConfig *cfg) {
+    FILE *f = fopen(filename, "r");
+    if (!f) { perror("fopen"); return -1; }
+
+    char line[256];
+    cfg->storage_count = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        char k[64], v[128];
+        if (sscanf(line, "%63[^=]=%127[^\n]", k, v) != 2) continue;
+
+        if      (strcmp(k, "PROXY_IP")   == 0) snprintf(cfg->bind_ip, sizeof(cfg->bind_ip), "%.*s", 63, v);
+        else if (strcmp(k, "PROXY_PORT") == 0) cfg->port = atoi(v);
+        else if (strncmp(k, "STORAGE_", 8) == 0) {
+            int id = atoi(k + 8);
+            char ip[64]; int port;
+            if (sscanf(v, "%63[^:]:%d", ip, &port) == 2 &&
+                cfg->storage_count < MAX_STORAGES) {
+                int i = cfg->storage_count++;
+                cfg->storages[i].id   = id;
+                snprintf(cfg->storages[i].ip, sizeof(cfg->storages[i].ip), "%.*s", 63, ip);
+                cfg->storages[i].port = port;
             }
         }
     }
-
-    close(sock_fd);
-    return status;
+    fclose(f);
+    init_hash_ring(cfg);
+    return 0;
 }
-void *handle_client(void *arg){
-    int client_fd = *(int *)arg;
-    free(arg);
 
-    struct MsgHeader header;
-    if (read_all(client_fd, &header, sizeof(header)) == sizeof(header)) {
-        char key[256] = {0};
-        char val[4096] = {0};
-
-        if (header.key_len > 0 && header.key_len < sizeof(key)) {
-            read_all(client_fd, key, header.key_len);
-        }
-        if (header.command == 0x02 && header.val_len > 0 && header.val_len < sizeof(val)) {
-            read_all(client_fd, val, header.val_len);
-        }
-
-        int storage_idx = get_storage_index(key, &config);
-        char resp_buf[4096] = {0};
-        uint32_t resp_len = 0;
-
-        int status = forward_to_storage(&config.storages[storage_idx], header.command, key, val, resp_buf, &resp_len);
-
-        write_all(client_fd, &status, 1);
-        if (header.command == 0x01 && status == 0x00) {
-            write_all(client_fd, &resp_len, sizeof(resp_len));
-            write_all(client_fd, resp_buf, resp_len);
-        }
-    }
-
-    close(client_fd);
-    return NULL;
-}
-int main() {
-    if (load_config("config.txt", &config) != 0) {
+/* ── main ──────────────────────────────────────────────────────── */
+int main(void) {
+    if (load_config("config.txt", &g_config) != 0) {
         fprintf(stderr, "Failed to load config.txt\n");
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    int server_fd;
-    struct sockaddr_in addr;
+    /* Initialise per-storage connection pools */
+    for (int i = 0; i < g_config.storage_count; i++)
+        pool_init(&g_config.pools[i],
+                  g_config.storages[i].ip,
+                  g_config.storages[i].port);
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        perror("Proxy: Socket failed");
-        exit(EXIT_FAILURE);
-    }
+    sem_init(&q_sem, 0, 0);
+
+    pthread_t workers[THREAD_POOL_SIZE];
+    for (int i = 0; i < THREAD_POOL_SIZE; i++)
+        pthread_create(&workers[i], NULL, worker_thread, NULL);
+
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) { perror("socket"); return EXIT_FAILURE; }
 
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(srv, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(config.bind_ip);
-    addr.sin_port = htons(config.port);
-
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("Proxy: Bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+    struct sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(g_config.port),
+        .sin_addr.s_addr = inet_addr(g_config.bind_ip),
+    };
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); return EXIT_FAILURE;
+    }
+    if (listen(srv, 4096) < 0) {
+        perror("listen"); return EXIT_FAILURE;
     }
 
-    if (listen(server_fd, 1024) == -1) {
-        perror("Proxy: Listen failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+    printf("Proxy on %s:%d  storages=%d  pool=%d  vnodes=%d  workers=%d\n",
+           g_config.bind_ip, g_config.port, g_config.storage_count,
+           CONN_POOL_SIZE, RING_VIRTUAL_NODES, THREAD_POOL_SIZE);
+
+    for (;;) {
+        int cfd = accept(srv, NULL, NULL);
+        if (cfd < 0) continue;
+        q_push(cfd);
     }
-
-    printf("Proxy listening on port %d with consistent hashing...\n", config.port);
-
-    while (1) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) continue;
-
-        int *pclient = malloc(sizeof(int));
-        if (pclient == NULL) {
-            close(client_fd);
-            continue;
-        }
-        *pclient = client_fd;
-
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, handle_client, pclient) != 0) {
-            close(client_fd);
-            free(pclient);
-            continue;
-        }
-        pthread_detach(tid);
-    }
-
-    close(server_fd);
-    return 0;
 }
