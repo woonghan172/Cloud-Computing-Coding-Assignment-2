@@ -17,22 +17,8 @@ make
 ```
 ./proxy
 ```
-5. Run benchmark
-```
-./benchmark 
-:8083: 127.0.0.1
-Benchmark: 4 workers × (2500 writes + 2500 reads)  (warmup=200)
 
-============== BENCHMARK RESULTS ==============
-Total time             : 0.4860 s
-Total ops  (r+w)       : 5850
-Throughput             : 12037.09 ops/sec
--------------- Latency (µs) -------------------
-Write  avg / p99       : 147.85 µs / 495.56 µs
-Read   avg / p99       : 129.92 µs / 367.33 µs
-===============================================
-```
-5-1. Also can run benchmark with setting number of worker threads.
+5. Run benchmark with setting the number of worker threads (If no argument default value is 4).
 
 ```
 ./benchmark 32
@@ -46,6 +32,20 @@ Throughput             : 31553.98 ops/sec
 -------------- Latency (µs) -------------------
 Write  avg / p99       : 383.55 µs / 733.42 µs
 Read   avg / p99       : 335.30 µs / 710.24 µs
+===============================================
+
+
+./benchmark 
+:8083: 127.0.0.1
+Benchmark: 4 workers × (2500 writes + 2500 reads)  (warmup=200)
+
+============== BENCHMARK RESULTS ==============
+Total time             : 0.4860 s
+Total ops  (r+w)       : 5850
+Throughput             : 12037.09 ops/sec
+-------------- Latency (µs) -------------------
+Write  avg / p99       : 147.85 µs / 495.56 µs
+Read   avg / p99       : 129.92 µs / 367.33 µs
 ===============================================
 ```
 
