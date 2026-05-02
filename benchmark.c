@@ -267,7 +267,7 @@ int main(int argc, char *argv[]) {
     pthread_t       threads[num_workers];
     struct ThreadArg args[num_workers];
 
-    printf("Benchmark: %d workers × %d writes + %d reads  (warmup=%d)\n\n",
+    printf("Benchmark: %d workers × (%d writes + %d reads)  (warmup=%d)\n\n",
            num_workers, ops_per, ops_per, WARMUP_OPS);
 
     long long t_start = now_ns();
